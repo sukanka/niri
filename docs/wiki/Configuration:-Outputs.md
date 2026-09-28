@@ -204,6 +204,10 @@ This flag enables variable refresh rate (VRR, also known as adaptive sync, FreeS
 
 You can check whether an output supports VRR in `niri msg outputs`.
 
+While the session is locked, niri temporarily disables VRR and uses fixed-refresh, VSync presentation.
+This avoids refresh-rate fluctuations on lock screens that update infrequently.
+Unlocking restores the configured VRR policy, including on-demand mode.
+
 > [!NOTE]
 > Some drivers have various issues with VRR.
 >
@@ -240,6 +244,8 @@ presentation before anything tears, either by using the tearing-control protocol
 emulators do this, sometimes behind a "disable vsync" option), or by matching an
 [`allow-tearing` window rule](./Configuration:-Window-Rules.md#allow-tearing). What this setting
 decides is whose requests niri will honor.
+
+Lock screens always use VSync, regardless of desktop window requests or the `force-tearing` debug option.
 
 | Value | Behavior |
 | --- | --- |

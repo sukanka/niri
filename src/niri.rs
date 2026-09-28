@@ -5540,7 +5540,18 @@ impl Niri {
             return;
         }
 
-        let current = self.layout.windows_for_output(output).any(|mapped| {
+        let current = self.output_wants_on_demand_vrr(output);
+        backend.set_output_on_demand_vrr(self, output, current);
+    }
+
+    pub(crate) fn output_wants_on_demand_vrr(&self, output: &Output) -> bool {
+        // The last desktop frame may still mark a window as visible when locking begins.
+        // Background windows must not control the lock screen's presentation policy.
+        if self.is_locked() {
+            return false;
+        }
+
+        self.layout.windows_for_output(output).any(|mapped| {
             mapped.rules().variable_refresh_rate == Some(true) && {
                 let mut visible = false;
                 mapped.window.with_surfaces(|surface, states| {
@@ -5552,12 +5563,14 @@ impl Niri {
                 });
                 visible
             }
-        });
-
-        backend.set_output_on_demand_vrr(self, output, current);
+        })
     }
 
     pub fn output_allows_tearing(&self, output: &Output) -> bool {
+        if self.is_locked() {
+            return false;
+        }
+
         let name = output.user_data().get::<OutputName>().unwrap();
         let mode = self
             .config

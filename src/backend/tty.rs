@@ -420,6 +420,8 @@ struct Surface {
     /// Whether the last rendered frame did direct scan-out on the primary plane. `None` until
     /// the first frame. Used to log scan-out transitions.
     was_direct_scanout: Option<bool>,
+    /// Last lock state reconciled with the output's refresh policy.
+    was_locked: bool,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
@@ -1509,7 +1511,7 @@ impl Tty {
         match surface.vrr_supported(connector.handle()) {
             Ok(VrrSupport::Supported | VrrSupport::RequiresModeset) => {
                 // Even if on-demand, we still disable it until later checks.
-                let vrr = config.is_vrr_always_on();
+                let vrr = effective_vrr(&config, false, niri.is_locked());
                 let word = if vrr { "enabling" } else { "disabling" };
 
                 if let Err(err) = surface.use_vrr(vrr) {
@@ -1938,6 +1940,7 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             was_direct_scanout: None,
+            was_locked: niri.is_locked(),
             gamma_props,
             pending_gamma_change: None,
             post_blend_unsupported_logged: false,
@@ -2379,6 +2382,7 @@ impl Tty {
         let span = tracy_client::span!("Tty::render");
 
         let mut rv = RenderResult::Skipped;
+        self.refresh_lock_vrr(niri, output);
         let render_node = self.render_node_for_output(output);
 
         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
@@ -2626,11 +2630,11 @@ impl Tty {
             };
             let mut flags = primary_scanout_flag | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
 
-            let presentation_mode = if debug.force_tearing || niri.output_allows_tearing(output) {
-                PresentationMode::Async
-            } else {
-                PresentationMode::VSync
-            };
+            let presentation_mode = presentation_mode(
+                niri.is_locked(),
+                debug.force_tearing,
+                niri.output_allows_tearing(output),
+            );
 
             if debug.enable_overlay_planes {
                 flags.insert(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
@@ -3106,8 +3110,10 @@ impl Tty {
     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
         let _span = tracy_client::span!("Tty::set_output_on_demand_vrr");
 
+        let locked = niri.is_locked();
         let output_state = niri.output_state.get_mut(output).unwrap();
         output_state.on_demand_vrr_enabled = enable_vrr;
+        let enable_vrr = enable_vrr && !locked;
         if output_state.frame_clock.vrr() == enable_vrr {
             return;
         }
@@ -3131,6 +3137,49 @@ impl Tty {
                 }
             }
         }
+    }
+
+    fn refresh_lock_vrr(&mut self, niri: &mut Niri, output: &Output) {
+        let locked = niri.is_locked();
+        let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+        let Some(device) = self.devices.get_mut(&tty_state.node) else {
+            return;
+        };
+        if !device.drm.is_active() {
+            return;
+        }
+        let Some(surface) = device.surfaces.get_mut(&tty_state.crtc) else {
+            return;
+        };
+        if surface.was_locked == locked {
+            return;
+        }
+        surface.was_locked = locked;
+
+        let output_state = niri.output_state.get_mut(output).unwrap();
+        let config = self.config.borrow();
+        let enabled = config.outputs.find(&surface.name).is_some_and(|config| {
+            effective_vrr(config, output_state.on_demand_vrr_enabled, locked)
+        });
+        drop(config);
+
+        // Lock surfaces often update very infrequently. Keep them at fixed refresh to
+        // avoid VRR brightness flicker, then restore the configured policy on unlock.
+        // Stage this before rendering so even the first lock frame uses the new policy.
+        if surface.compositor.vrr_enabled() == enabled {
+            return;
+        }
+        debug!(
+            connector = surface.name.connector,
+            locked, enabled, "updating VRR for session lock"
+        );
+        if let Err(err) = surface.compositor.use_vrr(enabled) {
+            warn!("error updating VRR for session lock: {err:?}");
+        }
+        output_state
+            .frame_clock
+            .set_vrr(surface.compositor.vrr_enabled());
+        self.refresh_ipc_outputs(niri);
     }
 
     fn compute_ignored_nodes(&self) -> HashSet<DrmNode> {
@@ -3211,6 +3260,7 @@ impl Tty {
 
     pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
         let _span = tracy_client::span!("Tty::on_output_config_changed");
+        let locked = niri.is_locked();
 
         // If we're inactive, we can't do anything, so just set a flag for later.
         if !self.session.is_active() {
@@ -3297,13 +3347,6 @@ impl Tty {
                 let change_mode = surface.compositor.pending_mode() != mode;
 
                 let vrr_enabled = surface.compositor.vrr_enabled();
-                let change_always_vrr = vrr_enabled != config.is_vrr_always_on();
-                let is_on_demand_vrr = config.is_vrr_on_demand();
-
-                if !change_mode && !change_always_vrr && !is_on_demand_vrr {
-                    continue;
-                }
-
                 let output = niri
                     .global_space
                     .outputs()
@@ -3321,10 +3364,12 @@ impl Tty {
                     continue;
                 };
 
-                if (is_on_demand_vrr && vrr_enabled != output_state.on_demand_vrr_enabled)
-                    || (!is_on_demand_vrr && change_always_vrr)
-                {
-                    let vrr = !vrr_enabled;
+                let vrr = effective_vrr(&config, output_state.on_demand_vrr_enabled, locked);
+                if !change_mode && vrr_enabled == vrr {
+                    continue;
+                }
+
+                if vrr_enabled != vrr {
                     let word = if vrr { "enabling" } else { "disabling" };
                     if let Err(err) = surface.compositor.use_vrr(vrr) {
                         warn!(
@@ -3634,6 +3679,18 @@ fn primary_node_from_config(config: &Config) -> Option<(DrmNode, DrmNode)> {
     debug!("attempting to use render node from config: {path:?}");
 
     primary_node_from_render_node(path)
+}
+
+fn effective_vrr(config: &niri_config::Output, on_demand: bool, locked: bool) -> bool {
+    !locked && (config.is_vrr_always_on() || (config.is_vrr_on_demand() && on_demand))
+}
+
+fn presentation_mode(locked: bool, force_tearing: bool, allows_tearing: bool) -> PresentationMode {
+    if !locked && (force_tearing || allows_tearing) {
+        PresentationMode::Async
+    } else {
+        PresentationMode::VSync
+    }
 }
 
 fn composition_render_node<Node>(
@@ -4488,8 +4545,51 @@ mod tests {
 
     use crate::backend::tty::{
         build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt,
-        composition_render_node, feedback_formats, EdidHdrInfo,
+        composition_render_node, effective_vrr, feedback_formats, presentation_mode, EdidHdrInfo,
     };
+
+    #[test]
+    fn lock_refresh_policy_restores_configured_vrr_on_unlock() {
+        use niri_config::Vrr;
+
+        for (setting, demand, expected_unlocked) in [
+            (None, false, false),
+            (None, true, false),
+            (Some(Vrr { on_demand: false }), false, true),
+            (Some(Vrr { on_demand: false }), true, true),
+            (Some(Vrr { on_demand: true }), false, false),
+            (Some(Vrr { on_demand: true }), true, true),
+        ] {
+            let config = niri_config::Output {
+                variable_refresh_rate: setting,
+                ..Default::default()
+            };
+            assert_eq!(effective_vrr(&config, demand, false), expected_unlocked);
+            assert!(!effective_vrr(&config, demand, true));
+            assert_eq!(effective_vrr(&config, demand, false), expected_unlocked);
+        }
+    }
+
+    #[test]
+    fn lock_presentation_ignores_tearing_requests_and_debug_override() {
+        use smithay::backend::renderer::PresentationMode;
+
+        for (forced, requested, expected_unlocked) in [
+            (false, false, PresentationMode::VSync),
+            (false, true, PresentationMode::Async),
+            (true, false, PresentationMode::Async),
+            (true, true, PresentationMode::Async),
+        ] {
+            assert_eq!(
+                presentation_mode(false, forced, requested),
+                expected_unlocked
+            );
+            assert_eq!(
+                presentation_mode(true, forced, requested),
+                PresentationMode::VSync
+            );
+        }
+    }
 
     #[test]
     fn output_gpu_selection_preserves_primary_and_display_only_fallback() {
