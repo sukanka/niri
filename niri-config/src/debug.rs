@@ -15,6 +15,7 @@ pub struct Debug {
     pub restrict_primary_scanout_to_matching_format: bool,
     pub force_disable_connectors_on_resume: bool,
     pub render_drm_device: Option<PathBuf>,
+    pub render_on_output_device: bool,
     pub ignored_drm_devices: Vec<PathBuf>,
     pub force_pipewire_invalid_modifier: bool,
     pub disable_pipewire_dmabuf: bool,
@@ -56,6 +57,8 @@ pub struct DebugPart {
     pub force_disable_connectors_on_resume: Option<Flag>,
     #[knuffel(child, unwrap(argument))]
     pub render_drm_device: Option<PathBuf>,
+    #[knuffel(child)]
+    pub render_on_output_device: Option<Flag>,
     #[knuffel(children(name = "ignore-drm-device"), unwrap(argument))]
     pub ignored_drm_devices: Vec<PathBuf>,
     #[knuffel(child)]
@@ -101,6 +104,7 @@ impl MergeWith<DebugPart> for Debug {
             disable_direct_scanout,
             restrict_primary_scanout_to_matching_format,
             force_disable_connectors_on_resume,
+            render_on_output_device,
             force_pipewire_invalid_modifier,
             disable_pipewire_dmabuf,
             emulate_zero_presentation_time,

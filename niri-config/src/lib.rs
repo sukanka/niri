@@ -642,6 +642,42 @@ mod tests {
         assert_eq!(config.input.keyboard.repeat_rate, 25);
     }
 
+    #[test]
+    fn render_on_output_device_default_and_merge() {
+        assert!(!do_parse("").debug.render_on_output_device);
+
+        let mut parsed = do_parse(
+            r#"
+            debug {
+                render-on-output-device
+                render-drm-device "/dev/dri/renderD128"
+            }
+            "#,
+        );
+        assert!(parsed.debug.render_on_output_device);
+        assert_eq!(
+            parsed.debug.render_drm_device,
+            Some(PathBuf::from("/dev/dri/renderD128")),
+        );
+
+        // Included config parts that omit the flag preserve its value.
+        parsed.debug.merge_with(&debug::DebugPart::default());
+        assert!(parsed.debug.render_on_output_device);
+
+        // An explicit false in an included config part overrides the flag.
+        parsed.debug.merge_with(&debug::DebugPart {
+            render_on_output_device: Some(Flag(false)),
+            ..Default::default()
+        });
+        assert!(!parsed.debug.render_on_output_device);
+
+        assert!(
+            !do_parse("debug { render-on-output-device false; }")
+                .debug
+                .render_on_output_device
+        );
+    }
+
     #[track_caller]
     fn do_parse(text: &str) -> Config {
         Config::parse_mem(text)
@@ -964,6 +1000,7 @@ mod tests {
 
             debug {
                 render-drm-device "/dev/dri/renderD129"
+                render-on-output-device
                 ignore-drm-device "/dev/dri/renderD128"
                 ignore-drm-device "/dev/dri/renderD130"
             }
@@ -2328,6 +2365,7 @@ mod tests {
                 render_drm_device: Some(
                     "/dev/dri/renderD129",
                 ),
+                render_on_output_device: true,
                 ignored_drm_devices: [
                     "/dev/dri/renderD128",
                     "/dev/dri/renderD130",
