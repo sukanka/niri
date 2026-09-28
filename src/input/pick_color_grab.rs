@@ -39,7 +39,7 @@ impl PickColorGrab {
         let (output, pos_within_output) = data.niri.output_under(location)?;
         let output = output.clone();
 
-        crate::with_primary_renderer_any!(data.backend, |renderer| {
+        crate::with_output_renderer_any!(data.backend, Some(&output), |renderer| {
             data.niri.update_render_elements(Some(&output));
 
             let scale = Scale::from(output.current_scale().fractional_scale());

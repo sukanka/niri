@@ -18,7 +18,7 @@ use libc::dev_t;
 use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
-use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
@@ -116,6 +116,12 @@ pub struct Tty {
     primary_node: DrmNode,
     // DRM render node corresponding to the primary GPU.
     primary_render_node: DrmNode,
+    // Fixed at startup: resources and buffer imports depend on this choice.
+    render_on_output_device: bool,
+    // Renderers with niri's shaders and compositor resources initialized.
+    initialized_render_nodes: HashSet<DrmNode>,
+    // Clear import hints when their GPU disappears, without keeping client buffers alive.
+    imported_dmabufs: HashSet<WeakDmabuf>,
     // Ignored DRM nodes.
     ignored_nodes: HashSet<DrmNode>,
     // Devices indexed by DRM node (not necessarily the render node).
@@ -123,6 +129,8 @@ pub struct Tty {
     // The dma-buf global corresponds to the output device (the primary GPU). It is only `Some()`
     // if we have a device corresponding to the primary GPU.
     dmabuf_global: Option<DmabufGlobal>,
+    // Smithay validates buffer Fourcc values against the global's original format list.
+    dmabuf_global_formats: HashSet<Fourcc>,
     // The output config had changed, but the session is paused, so we need to update it on resume.
     update_output_config_on_resume: bool,
     // Whether the debug tinting is enabled.
@@ -582,6 +590,10 @@ impl Tty {
             write!(node_path, "{primary_render_node}").unwrap();
         }
         info!("using as the render node: {node_path}");
+        let render_on_output_device = config.borrow().debug.render_on_output_device;
+        if render_on_output_device {
+            info!("compositing each output on its own GPU when available");
+        }
 
         Ok(Self {
             config,
@@ -591,9 +603,13 @@ impl Tty {
             gpu_manager,
             primary_node,
             primary_render_node,
+            render_on_output_device,
+            initialized_render_nodes: HashSet::new(),
+            imported_dmabufs: HashSet::new(),
             ignored_nodes: HashSet::new(),
             devices: HashMap::new(),
             dmabuf_global: None,
+            dmabuf_global_formats: HashSet::new(),
             update_output_config_on_resume: false,
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
@@ -883,6 +899,10 @@ impl Tty {
                 .add_node(render_node, gbm.clone())
                 .context("error adding render node to GPU manager")?;
 
+            if self.render_on_output_device || render_node == self.primary_render_node {
+                self.initialize_renderer(render_node)?;
+            }
+
             Ok(render_node)
         };
 
@@ -913,32 +933,11 @@ impl Tty {
                 debug!("bound legacy EGL to wl_display");
             }
 
-            if renderer.as_gles_renderer().is_some() {
-                let gles_renderer = renderer.as_gles_renderer().unwrap();
-                resources::init(gles_renderer);
-                shaders::init(gles_renderer);
-                blend::FrameBlendState::init(gles_renderer);
-            } else if renderer.as_vulkan_renderer().is_some() {
-                shaders::init_vulkan(renderer.as_vulkan_renderer().unwrap());
-                info!("running on the vulkan renderer");
-            }
-
-            let config = self.config.borrow();
-            if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
-                shaders::set_custom_resize_program(&mut renderer, Some(src));
-            }
-            if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
-                shaders::set_custom_close_program(&mut renderer, Some(src));
-            }
-            if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
-                shaders::set_custom_open_program(&mut renderer, Some(src));
-            }
-            drop(config);
-
             niri.update_shaders();
 
             // Create the dmabuf global.
             let primary_formats = renderer.dmabuf_formats();
+            self.dmabuf_global_formats = primary_formats.iter().map(|f| f.code).collect();
             let default_feedback =
                 DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
                     .build()
@@ -955,11 +954,21 @@ impl Tty {
 
             // Update the dmabuf feedbacks for all surfaces.
             for (node, device) in self.devices.iter_mut() {
+                let render_node = composition_render_node(
+                    self.render_on_output_device,
+                    self.primary_render_node,
+                    device.render_node,
+                );
+                let Ok(renderer) = self.gpu_manager.single_renderer(&render_node) else {
+                    continue;
+                };
+                let render_formats =
+                    feedback_formats(renderer.dmabuf_formats(), &self.dmabuf_global_formats);
                 for surface in device.surfaces.values_mut() {
                     match surface_dmabuf_feedback(
                         &surface.compositor,
-                        primary_formats.clone(),
-                        self.primary_render_node,
+                        render_formats.clone(),
+                        render_node,
                         device.render_node,
                         *node,
                     ) {
@@ -1270,6 +1279,7 @@ impl Tty {
 
                 // Disable and destroy the dmabuf global.
                 if let Some(global) = self.dmabuf_global.take() {
+                    self.dmabuf_global_formats.clear();
                     niri.remove_syncobj_state();
                     niri.dmabuf_state
                         .disable_global::<State>(&niri.display_handle, &global);
@@ -1298,6 +1308,18 @@ impl Tty {
             }
 
             if was_last {
+                self.imported_dmabufs.retain(|weak| {
+                    let Some(dmabuf) = weak.upgrade() else {
+                        return false;
+                    };
+                    if dmabuf.node() == Some(render_node) {
+                        // MultiRenderer treats a known but removed source as a hard error.
+                        // Let the next output renderer try importing the buffer directly.
+                        dmabuf.set_node(None);
+                    }
+                    true
+                });
+                self.initialized_render_nodes.remove(&render_node);
                 self.gpu_manager.remove_node(&render_node);
                 // Trigger re-enumeration in order to remove the device from gpu_manager.
                 self.gpu_manager.refresh_devices();
@@ -1545,6 +1567,20 @@ impl Tty {
         }
 
         let render_node = device.render_node.unwrap_or(self.primary_render_node);
+        let composition_node = composition_render_node(
+            self.render_on_output_device,
+            self.primary_render_node,
+            device.render_node,
+        );
+        if self.render_on_output_device {
+            info!(
+                connector = connector_name,
+                render_node = %composition_node,
+                scanout_node = %node,
+                primary_fallback = device.render_node.is_none(),
+                "selected composition GPU for output"
+            );
+        }
         let renderer = self.gpu_manager.single_renderer(&render_node)?;
         let render_formats = Bind::<Dmabuf>::supported_formats(&renderer).unwrap_or_default();
         let render_formats = &render_formats;
@@ -1625,7 +1661,7 @@ impl Tty {
                 };
 
                 let render_ok = match self.gpu_manager.renderer(
-                    &self.primary_render_node,
+                    &composition_node,
                     &render_node,
                     compositor.format(),
                 ) {
@@ -1771,10 +1807,11 @@ impl Tty {
 
         // Do one throwaway `render_frame` — the exact path that would fail — and, if it errors,
         // recreate the compositor with 8-bit formats. HDR signalling still works on an 8-bit
-        // framebuffer, just with banding. Only runs for 10-bit HDR outputs, once per connector at setup.
+        // framebuffer, just with banding. Only runs for 10-bit HDR outputs, once per connector at
+        // setup.
         if using_10bit_formats {
             let trial_ok = match self.gpu_manager.renderer(
-                &self.primary_render_node,
+                &composition_node,
                 &render_node,
                 compositor.format(),
             ) {
@@ -1848,13 +1885,14 @@ impl Tty {
         }
 
         let mut dmabuf_feedback = None;
-        if let Ok(primary_renderer) = self.gpu_manager.single_renderer(&self.primary_render_node) {
-            let primary_formats = primary_renderer.dmabuf_formats();
+        if let Ok(renderer) = self.gpu_manager.single_renderer(&composition_node) {
+            let render_formats =
+                feedback_formats(renderer.dmabuf_formats(), &self.dmabuf_global_formats);
 
             match surface_dmabuf_feedback(
                 &compositor,
-                primary_formats,
-                self.primary_render_node,
+                render_formats,
+                composition_node,
                 device.render_node,
                 node,
             ) {
@@ -2244,6 +2282,74 @@ impl Tty {
         Some(super::PrimaryRenderer::Tty(renderer))
     }
 
+    pub fn render_on_output_device(&self) -> bool {
+        self.render_on_output_device
+    }
+
+    pub fn render_node_for_output(&self, output: &Output) -> DrmNode {
+        let output_node = output
+            .user_data()
+            .get::<TtyOutputState>()
+            .and_then(|state| self.devices.get(&state.node))
+            .and_then(|device| device.render_node);
+        composition_render_node(
+            self.render_on_output_device,
+            self.primary_render_node,
+            output_node,
+        )
+    }
+
+    /// Uses the same GPU as composition, without copying to the output's scanout GPU.
+    pub fn renderer_for_output(&mut self, output: &Output) -> Option<super::PrimaryRenderer<'_>> {
+        let node = self.render_node_for_output(output);
+        let renderer = self.gpu_manager.single_renderer(&node).ok()?;
+        Some(super::PrimaryRenderer::Tty(renderer))
+    }
+
+    /// Apply changes such as custom shaders to every GPU used for composition.
+    pub fn for_each_renderer(&mut self, mut f: impl FnMut(&mut TtyRenderer<'_>)) {
+        for node in &self.initialized_render_nodes {
+            match self.gpu_manager.single_renderer(node) {
+                Ok(mut renderer) => f(&mut renderer),
+                Err(err) => warn!(%node, "error accessing renderer: {err:?}"),
+            }
+        }
+    }
+
+    fn initialize_renderer(&mut self, node: DrmNode) -> anyhow::Result<()> {
+        if self.initialized_render_nodes.contains(&node) {
+            return Ok(());
+        }
+
+        let mut renderer = self.gpu_manager.single_renderer(&node)?;
+        if let Some(gles) = renderer.as_gles_renderer() {
+            resources::init(gles);
+            shaders::init(gles);
+            blend::FrameBlendState::init(gles);
+        } else if let Some(vulkan) = renderer.as_vulkan_renderer() {
+            shaders::init_vulkan(vulkan);
+            info!(%node, "running on the vulkan renderer");
+        }
+        crate::render_helpers::texture::set_texture_portability(
+            &mut renderer,
+            self.render_on_output_device,
+        );
+
+        let config = self.config.borrow();
+        if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
+            shaders::set_custom_resize_program(&mut renderer, Some(src));
+        }
+        if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
+            shaders::set_custom_close_program(&mut renderer, Some(src));
+        }
+        if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
+            shaders::set_custom_open_program(&mut renderer, Some(src));
+        }
+
+        self.initialized_render_nodes.insert(node);
+        Ok(())
+    }
+
     pub fn with_primary_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
@@ -2273,6 +2379,7 @@ impl Tty {
         let span = tracy_client::span!("Tty::render");
 
         let mut rv = RenderResult::Skipped;
+        let render_node = self.render_node_for_output(output);
 
         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
@@ -2482,13 +2589,13 @@ impl Tty {
         }
 
         let mut renderer = match self.gpu_manager.renderer(
-            &self.primary_render_node,
+            &render_node,
             &device.render_node.unwrap_or(self.primary_render_node),
             surface.compositor.format(),
         ) {
             Ok(renderer) => renderer,
             Err(err) => {
-                warn!("error creating renderer for primary GPU: {err:?}");
+                warn!(%render_node, "error creating renderer for output GPU: {err:?}");
                 return rv;
             }
         };
@@ -2722,6 +2829,15 @@ impl Tty {
     }
 
     pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        if self.render_on_output_device {
+            if !self.gpu_manager.validate_dmabuf_import(dmabuf) {
+                return false;
+            }
+            self.imported_dmabufs.retain(|weak| !weak.is_gone());
+            self.imported_dmabufs.insert(dmabuf.weak());
+            return true;
+        }
+
         let mut renderer = match self.gpu_manager.single_renderer(&self.primary_render_node) {
             Ok(renderer) => renderer,
             Err(err) => {
@@ -2745,6 +2861,12 @@ impl Tty {
     }
 
     pub fn early_import(&mut self, surface: &WlSurface) {
+        if self.render_on_output_device {
+            // A commit need not belong to a mapped window yet. Import when generating the
+            // output's elements instead, so we don't copy buffers to an unrelated GPU or
+            // cache it as their source before the destination output is known.
+            return;
+        }
         if let Err(err) = self.gpu_manager.early_import(
             // We always render on the primary GPU.
             self.primary_render_node,
@@ -2948,6 +3070,18 @@ impl Tty {
         let device = device.or_else(|| self.devices.get(&self.primary_node));
 
         Some(device?.gbm.clone())
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub fn gbm_device_for_output(&self, output: &Output) -> Option<GbmDevice<DeviceFd>> {
+        let node = self.render_node_for_output(output);
+        if node == self.primary_render_node {
+            return self.primary_gbm_device();
+        }
+        self.devices
+            .values()
+            .find(|device| device.render_node == Some(node))
+            .map(|device| device.gbm.clone())
     }
 
     pub fn set_monitors_active(&mut self, active: bool) {
@@ -3502,6 +3636,18 @@ fn primary_node_from_config(config: &Config) -> Option<(DrmNode, DrmNode)> {
     primary_node_from_render_node(path)
 }
 
+fn composition_render_node<Node>(
+    render_on_output_device: bool,
+    primary_render_node: Node,
+    output_render_node: Option<Node>,
+) -> Node {
+    if render_on_output_device {
+        output_render_node.unwrap_or(primary_render_node)
+    } else {
+        primary_render_node
+    }
+}
+
 fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
     let mut disabled_nodes = HashSet::new();
 
@@ -3515,13 +3661,30 @@ fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
     disabled_nodes
 }
 
+fn feedback_formats(formats: FormatSet, global_formats: &HashSet<Fourcc>) -> FormatSet {
+    // Smithay validates the Fourcc against the global when a wl_buffer is created,
+    // including for clients using per-surface feedback. Local modifiers need not
+    // match the primary GPU: they only need to be readable by the output GPU.
+    formats
+        .iter()
+        .filter(|format| global_formats.contains(&format.code))
+        .copied()
+        .collect()
+}
+
 fn surface_dmabuf_feedback(
     compositor: &GbmDrmCompositor,
-    primary_formats: FormatSet,
-    primary_render_node: DrmNode,
+    render_formats: FormatSet,
+    render_node: DrmNode,
     surface_render_node: Option<DrmNode>,
     surface_scanout_node: DrmNode,
 ) -> Result<SurfaceDmabufFeedback, io::Error> {
+    if render_formats.iter().next().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "output renderer has no dma-buf formats supported by the global",
+        ));
+    }
     let surface = compositor.surface();
     let planes = surface.planes();
 
@@ -3550,19 +3713,19 @@ fn surface_dmabuf_feedback(
     // We limit the scan-out trache to formats we can also render from so that there is always a
     // fallback render path available in case the supplied buffer can not be scanned out directly.
     let mut primary_scanout_formats = primary_plane_formats
-        .intersection(&primary_formats)
+        .intersection(&render_formats)
         .copied()
         .collect::<Vec<_>>();
     let mut primary_or_overlay_scanout_formats = primary_or_overlay_plane_formats
-        .intersection(&primary_formats)
+        .intersection(&render_formats)
         .copied()
         .collect::<Vec<_>>();
     let mut primary_scanout_async_formats = primary_async_formats
-        .intersection(&primary_formats)
+        .intersection(&render_formats)
         .copied()
         .collect::<Vec<_>>();
     let mut primary_or_overlay_scanout_async_formats = primary_or_overlay_async_formats
-        .intersection(&primary_formats)
+        .intersection(&render_formats)
         .copied()
         .collect::<Vec<_>>();
 
@@ -3571,14 +3734,18 @@ fn surface_dmabuf_feedback(
     //
     // Also limit scan-out formats to Linear if we have a device without a render node (i.e.
     // we're rendering on a different device).
-    if surface_render_node != Some(primary_render_node) {
+    if surface_render_node != Some(render_node) {
         primary_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
         primary_or_overlay_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
         primary_scanout_async_formats.retain(|f| f.modifier == Modifier::Linear);
         primary_or_overlay_scanout_async_formats.retain(|f| f.modifier == Modifier::Linear);
     }
 
-    let builder = DmabufFeedbackBuilder::new(primary_render_node.dev_id(), primary_formats);
+    // Surface feedback may change its main device as a window moves between GPUs.
+    // v4/v5 permit this; v6 instead receives the builder's sampling tranche. Older
+    // clients keep using the primary GPU's default feedback and are imported through
+    // the multi-GPU fallback when necessary.
+    let builder = DmabufFeedbackBuilder::new(render_node.dev_id(), render_formats);
 
     trace!(
         "primary scanout formats: {}, overlay adds: {}",
@@ -3620,9 +3787,9 @@ fn surface_dmabuf_feedback(
         )
         .build()?;
 
-    // If this is the primary node surface, send scanout formats in both tranches to avoid
+    // If rendering and scanout use the same GPU, include scanout formats in both tranches to avoid
     // duplication.
-    let render = if surface_render_node == Some(primary_render_node) {
+    let render = if surface_render_node == Some(render_node) {
         scanout.clone()
     } else {
         builder.build()?
@@ -4317,12 +4484,52 @@ mod tests {
     use insta::assert_debug_snapshot;
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
-
     use smithay::wayland::color::management::ImageDescription;
 
     use crate::backend::tty::{
-        build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt, EdidHdrInfo,
+        build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt,
+        composition_render_node, feedback_formats, EdidHdrInfo,
     };
+
+    #[test]
+    fn output_gpu_selection_preserves_primary_and_display_only_fallback() {
+        // Use symbolic nodes so this exercises the routing policy without requiring
+        // physical DRM devices in the test environment.
+        let primary = "discrete";
+        let outputs = [Some("integrated"), Some("discrete"), None];
+        let select =
+            |enabled| outputs.map(|output| composition_render_node(enabled, primary, output));
+
+        assert_eq!(select(false), ["discrete", "discrete", "discrete"]);
+        assert_eq!(select(true), ["integrated", "discrete", "discrete"]);
+    }
+
+    #[test]
+    fn output_feedback_keeps_local_modifiers_for_global_fourccs() {
+        use smithay::backend::allocator::{Format, Fourcc, Modifier};
+
+        let local = [
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: Modifier::Linear,
+            },
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: Modifier::Invalid,
+            },
+            Format {
+                code: Fourcc::Nv12,
+                modifier: Modifier::Linear,
+            },
+        ];
+        let allowed = [Fourcc::Argb8888].into_iter().collect();
+        let result = feedback_formats(local.into_iter().collect(), &allowed);
+
+        assert_eq!(result.iter().count(), 2);
+        assert!(result.contains(&local[0]));
+        assert!(result.contains(&local[1]));
+        assert!(!result.contains(&local[2]));
+    }
 
     #[test]
     fn hdr_metadata_luminance_priorities() {

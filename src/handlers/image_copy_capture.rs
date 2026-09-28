@@ -89,15 +89,15 @@ pub fn source_output(source: &ImageCaptureSource) -> Option<Output> {
 
 /// Buffer constraints for capturing an output.
 ///
-/// `render_node` is the primary renderer's DRM render node (see
-/// `Backend::primary_render_node()`), and only shm will be supported without
+/// `render_node` is the output renderer's DRM render node (see
+/// `Backend::render_node_for_output()`), and only shm will be supported without
 /// one. It is required since querying it from the EGL context fails for the TTY
 /// backend: since Mesa 23.3 and until at least 26.1.8, `_eglGetGbmDisplay()`
 /// clears the display's EGLDevice once a second EGLDisplay is created for the
 /// same GBM device, which the TTY backend does during initialization. See
 /// https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44351.
 ///
-/// `render_formats` are the dmabuf formats the primary renderer can draw into
+/// `render_formats` are the dmabuf formats the output renderer can draw into
 /// (`Bind::<Dmabuf>::supported_formats()`), queried generically so that this
 /// works on both the GLES and Vulkan renderers.
 pub fn output_capture_constraints(
@@ -307,8 +307,8 @@ impl ImageCopyCaptureHandler for State {
             return None;
         }
 
-        let render_node = self.backend.primary_render_node();
-        let render_formats = primary_render_formats(&mut self.backend)?;
+        let render_node = self.backend.render_node_for_output(&output);
+        let render_formats = output_render_formats(&mut self.backend, &output)?;
         output_capture_constraints(render_formats.as_ref(), render_node, &output)
     }
 
@@ -460,10 +460,10 @@ impl ImageCopyCaptureHandler for State {
     }
 }
 
-/// The dmabuf formats the primary renderer can draw into, or `Some(None)` if the renderer doesn't
-/// report any. `None` if there is no primary renderer.
-pub fn primary_render_formats(backend: &mut Backend) -> Option<Option<FormatSet>> {
-    crate::with_primary_renderer_any!(backend, |renderer| {
+/// The dmabuf formats the output renderer can draw into, or `Some(None)` if it doesn't
+/// report any. `None` if the renderer is unavailable.
+pub fn output_render_formats(backend: &mut Backend, output: &Output) -> Option<Option<FormatSet>> {
+    crate::with_output_renderer_any!(backend, Some(output), |renderer| {
         Bind::<Dmabuf>::supported_formats(renderer)
     })
 }

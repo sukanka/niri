@@ -52,6 +52,11 @@ On some laptops this can cause lag and stuttering (it gets worse with monitor re
 If your laptop has a MUX switch—usually a GPU toggle in the UEFI settings—then you can switch it to use the discrete GPU, then niri will render on the discrete GPU, and the external monitor won't lag.
 Otherwise, you can try configuring niri to render on the discrete GPU via the [`render-drm-device`](./Configuration:-Debug-Options.md#render-drm-device) debug option.
 
+Alternatively, this tree provides the experimental [`render-on-output-device`](./Configuration:-Debug-Options.md#render-on-output-device) debug option.
+It composites each monitor on its connected GPU, so applications using the integrated GPU on the internal panel and games using the discrete GPU on the external monitor can avoid cross-GPU copies in their normal display paths.
+Application GPU selection is still separate, and windows rendered on a different GPU from their monitor still require cross-GPU access.
+Restart niri after changing this option.
+
 Keep in mind that using the discrete GPU for rendering will make the laptop's battery deplete much faster.
 
 ### How to run X11 apps like Steam or Discord?

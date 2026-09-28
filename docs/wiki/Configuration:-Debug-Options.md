@@ -21,6 +21,7 @@ debug {
     restrict-primary-scanout-to-matching-format
     force-disable-connectors-on-resume
     render-drm-device "/dev/dri/renderD129"
+    render-on-output-device
     ignore-drm-device "/dev/dri/renderD128"
     ignore-drm-device "/dev/dri/renderD130"
     force-pipewire-invalid-modifier
@@ -165,13 +166,41 @@ debug {
 
 ### `render-drm-device`
 
-Override the DRM device that niri will use for all rendering.
+Override niri's primary rendering DRM device.
 
 You can set this to make niri use a different primary GPU than the default one.
+Normally, all outputs are composited on this GPU.
+With [`render-on-output-device`](#render-on-output-device), each output is composited on its own GPU, while the primary GPU remains the default for clients and the fallback for outputs without a render node.
 
 ```kdl
 debug {
     render-drm-device "/dev/dri/renderD129"
+}
+```
+
+### `render-on-output-device`
+
+Composite each output on the GPU that drives it, instead of compositing all outputs on the primary GPU.
+Outputs whose DRM device has no usable render node fall back to the primary GPU.
+This option is disabled by default and requires restarting niri to take effect.
+
+This is useful on hybrid GPU laptops with the internal panel connected to the integrated GPU and an external gaming monitor connected to the discrete GPU.
+If applications render on the GPU driving their output, their normal display path can avoid cross-GPU copies, including when a fullscreen game needs compositing instead of direct scanout.
+Fullscreen alone does not guarantee direct scanout.
+
+The option controls niri's compositor, not which GPU an application uses.
+For integrated-GPU desktop applications and discrete-GPU games, keep the integrated GPU as the primary GPU (or select it with [`render-drm-device`](#render-drm-device)) and launch games with the appropriate GPU selection settings.
+Moving a window to an output on another GPU does not force the application to switch GPUs, so cross-GPU copies may still be necessary for that window.
+Screen capture and other offscreen rendering may also require cross-GPU transfers.
+When this option is enabled, PipeWire window captures and dynamic-target screencasts use shared-memory buffers, so that moving their target between GPUs does not leave DMA-BUF buffers tied to the previous GPU.
+Fixed-output screencasts can still use DMA-BUF buffers allocated on that output's GPU.
+
+```kdl
+debug {
+    render-on-output-device
+    // Optional: select the integrated GPU as the primary GPU.
+    // Use your integrated GPU's actual render-node path.
+    // render-drm-device "/dev/dri/by-path/pci-0000:07:00.0-render"
 }
 ```
 

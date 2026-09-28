@@ -931,7 +931,7 @@ impl XdgShellHandler for State {
 
         let transaction = Transaction::new();
         let blocker = transaction.blocker();
-        crate::with_primary_renderer_any!(self.backend, |renderer| {
+        crate::with_output_renderer_any!(self.backend, output.as_ref(), |renderer| {
             self.niri
                 .layout
                 .start_close_animation_for_window(renderer, &window, blocker);
@@ -1645,7 +1645,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             state.store_unmap_snapshot(&window, output.as_ref());
         } else {
             if animate {
-                crate::with_primary_renderer_any!(state.backend, |renderer| {
+                crate::with_output_renderer_any!(state.backend, output, |renderer| {
                     mapped.store_animation_snapshot(renderer);
                 });
             }

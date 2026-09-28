@@ -56,6 +56,41 @@ macro_rules! with_primary_renderer_any {
     };
 }
 
+/// Runs a body with the renderer used to composite an output. With no output,
+/// uses the primary renderer (for example, for windows on a disconnected output).
+#[macro_export]
+macro_rules! with_output_renderer_any {
+    ($backend:expr, $output:expr, |$renderer:ident| $body:expr) => {
+        match $backend.renderer_for_output($output) {
+            Some($crate::backend::PrimaryRenderer::Tty(mut renderer)) => {
+                let $renderer = &mut renderer;
+                Some($body)
+            }
+            Some($crate::backend::PrimaryRenderer::Gles(renderer)) => {
+                let $renderer = renderer;
+                Some($body)
+            }
+            None => None,
+        }
+    };
+}
+
+/// Updates resources on every GPU used for compositing, including outputs that
+/// were initialized with a different GPU from the primary renderer.
+#[macro_export]
+macro_rules! with_all_renderers_any {
+    ($backend:expr, |$renderer:ident| $body:expr) => {
+        match &mut $backend {
+            $crate::backend::Backend::Tty(tty) => {
+                tty.for_each_renderer(|$renderer| $body);
+            }
+            backend => {
+                $crate::with_primary_renderer_any!(backend, |$renderer| $body);
+            }
+        }
+    };
+}
+
 /// HDR capabilities of an output, inserted into the [`Output`]'s user data by the backend.
 ///
 /// `supported` requires the DRM connector to expose the `Colorspace` (with BT2020_RGB) and
@@ -181,6 +216,24 @@ impl Backend {
         }
     }
 
+    pub fn renderer_for_output(&mut self, output: Option<&Output>) -> Option<PrimaryRenderer<'_>> {
+        match (self, output) {
+            (Backend::Tty(tty), Some(output)) => tty.renderer_for_output(output),
+            (backend, _) => backend.primary_renderer(),
+        }
+    }
+
+    pub fn render_node_for_output(&mut self, output: &Output) -> Option<DrmNode> {
+        match self {
+            Backend::Tty(tty) => Some(tty.render_node_for_output(output)),
+            backend => backend.primary_render_node(),
+        }
+    }
+
+    pub fn render_on_output_device(&self) -> bool {
+        matches!(self, Backend::Tty(tty) if tty.render_on_output_device())
+    }
+
     pub fn render(
         &mut self,
         niri: &mut Niri,
@@ -263,6 +316,17 @@ impl Backend {
             Backend::Tty(tty) => tty.primary_gbm_device(),
             Backend::Winit(winit) => winit.gbm_device(),
             Backend::Headless(_) => None,
+        }
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub fn gbm_device_for_output(
+        &self,
+        output: Option<&Output>,
+    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>> {
+        match (self, output) {
+            (Backend::Tty(tty), Some(output)) => tty.gbm_device_for_output(output),
+            (backend, _) => backend.gbm_device(),
         }
     }
 

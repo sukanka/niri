@@ -749,14 +749,12 @@ impl State {
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
-                crate::with_primary_renderer_any!(self.backend, |renderer| {
-                    self.niri.do_screen_transition(renderer, delay_ms);
-                });
+                self.niri.do_screen_transition(&mut self.backend, delay_ms);
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
                 let active = self.niri.layout.active_output().cloned();
                 if let Some(active) = active {
-                    crate::with_primary_renderer_any!(self.backend, |renderer| {
+                    crate::with_output_renderer_any!(self.backend, Some(&active), |renderer| {
                         if let Err(err) = self.niri.screenshot(
                             renderer,
                             &active,
@@ -794,7 +792,7 @@ impl State {
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
-                    crate::with_primary_renderer_any!(self.backend, |renderer| {
+                    crate::with_output_renderer_any!(self.backend, Some(output), |renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
                             output,
@@ -818,7 +816,7 @@ impl State {
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
-                    crate::with_primary_renderer_any!(self.backend, |renderer| {
+                    crate::with_output_renderer_any!(self.backend, Some(output), |renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
                             output,

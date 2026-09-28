@@ -25,11 +25,12 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
+use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
+
 use crate::layout::LayoutElementRenderElement;
 use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::ui::minimized_strip::MinimizedStripRenderElement;
 use crate::ui::mru::WindowMruUiRenderElement;
-use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
 pub struct Screencasting {
     pub casts: Vec<Cast>,
@@ -82,7 +83,11 @@ impl Screencasting {
 }
 
 impl State {
-    fn prepare_pw_cast(&mut self) -> anyhow::Result<Option<(GbmDevice<DeviceFd>, FormatSet)>> {
+    fn prepare_pw_cast(
+        &mut self,
+        target: &CastTarget,
+        dynamic_target: bool,
+    ) -> anyhow::Result<Option<(GbmDevice<DeviceFd>, FormatSet)>> {
         // Ensure PipeWire is initialized.
         if self.niri.casting.pipewire.is_none() {
             let pw = PipeWire::new(
@@ -97,12 +102,25 @@ impl State {
             return Ok(None);
         }
 
-        let Some(gbm) = self.backend.gbm_device() else {
+        // A window or dynamic target can move to another GPU while the stream
+        // keeps its allocated buffers. Use shared memory in this case until
+        // PipeWire streams can renegotiate the allocator when their GPU changes.
+        if self.backend.render_on_output_device()
+            && (dynamic_target || !matches!(target, CastTarget::Output { .. }))
+        {
+            return Ok(None);
+        }
+
+        let output = match target {
+            CastTarget::Output { output, .. } => output.upgrade(),
+            _ => None,
+        };
+        let Some(gbm) = self.backend.gbm_device_for_output(output.as_ref()) else {
             // We will offer shm only.
             return Ok(None);
         };
 
-        let mut render_formats = crate::with_primary_renderer_any!(self.backend, |renderer| {
+        let mut render_formats = crate::with_output_renderer_any!(self.backend, output.as_ref(), |renderer| {
             smithay::backend::renderer::Bind::<smithay::backend::allocator::dmabuf::Dmabuf>::supported_formats(
                 renderer,
             )
@@ -209,7 +227,7 @@ impl State {
                 }
             }
 
-            crate::with_primary_renderer_any!(self.backend, |renderer| {
+            crate::with_output_renderer_any!(self.backend, Some(output), |renderer| {
                 let mut elements = Vec::new();
                 let mut pointer_location = Point::default();
 
@@ -344,7 +362,7 @@ impl State {
             }
         };
 
-        let gbm = match self.prepare_pw_cast() {
+        let gbm = match self.prepare_pw_cast(target, true) {
             Ok(x) => x,
             Err(err) => {
                 warn!("error starting pending screencasts: {err:?}");
@@ -441,7 +459,7 @@ impl State {
                     }
                 };
 
-                let gbm = match self.prepare_pw_cast() {
+                let gbm = match self.prepare_pw_cast(&target, false) {
                     Ok(x) => x,
                     Err(err) => {
                         warn!("error starting screencast: {err:?}");

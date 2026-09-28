@@ -1012,15 +1012,16 @@ impl State {
             }
 
             // The size changed, so build the full constraints and send them to the client below.
-            let render_node = self.backend.primary_render_node();
-            let constraints = image_copy_capture_impl::primary_render_formats(&mut self.backend)
-                .and_then(|render_formats| {
-                    image_copy_capture_impl::output_capture_constraints(
-                        render_formats.as_ref(),
-                        render_node,
-                        &output,
-                    )
-                });
+            let render_node = self.backend.render_node_for_output(&output);
+            let constraints =
+                image_copy_capture_impl::output_render_formats(&mut self.backend, &output)
+                    .and_then(|render_formats| {
+                        image_copy_capture_impl::output_capture_constraints(
+                            render_formats.as_ref(),
+                            render_node,
+                            &output,
+                        )
+                    });
             let Some(constraints) = constraints else {
                 return false;
             };
@@ -1916,7 +1917,7 @@ impl State {
             != old_config.animations.window_resize.custom_shader
         {
             let src = config.animations.window_resize.custom_shader.as_deref();
-            crate::with_primary_renderer_any!(self.backend, |renderer| {
+            crate::with_all_renderers_any!(self.backend, |renderer| {
                 shaders::set_custom_resize_program(renderer, src);
             });
             shaders_changed = true;
@@ -1926,7 +1927,7 @@ impl State {
             != old_config.animations.window_close.custom_shader
         {
             let src = config.animations.window_close.custom_shader.as_deref();
-            crate::with_primary_renderer_any!(self.backend, |renderer| {
+            crate::with_all_renderers_any!(self.backend, |renderer| {
                 shaders::set_custom_close_program(renderer, src);
             });
             shaders_changed = true;
@@ -1936,7 +1937,7 @@ impl State {
             != old_config.animations.window_open.custom_shader
         {
             let src = config.animations.window_open.custom_shader.as_deref();
-            crate::with_primary_renderer_any!(self.backend, |renderer| {
+            crate::with_all_renderers_any!(self.backend, |renderer| {
                 shaders::set_custom_open_program(renderer, src);
             });
             shaders_changed = true;
@@ -2339,11 +2340,10 @@ impl State {
 
         self.niri.update_render_elements(None);
 
-        let Some(screenshots) = crate::with_primary_renderer_any!(self.backend, |renderer| {
-            self.niri.capture_screenshots(renderer).collect()
-        }) else {
+        let screenshots = self.niri.capture_screenshots(&mut self.backend);
+        if screenshots.is_empty() {
             return;
-        };
+        }
 
         // Now that we captured the screenshots, clear grabs like drag-and-drop, etc.
         let time = InputTime::now();
@@ -2389,12 +2389,16 @@ impl State {
     }
 
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
-        let ScreenshotUi::Open { path, .. } = &mut self.niri.screenshot_ui else {
+        let ScreenshotUi::Open {
+            path, selection, ..
+        } = &mut self.niri.screenshot_ui
+        else {
             return;
         };
         let path = path.take();
+        let output = selection.0.clone();
 
-        crate::with_primary_renderer_any!(self.backend, |renderer| {
+        crate::with_output_renderer_any!(self.backend, Some(&output), |renderer| {
             match self.niri.screenshot_ui.capture(renderer) {
                 Ok((size, pixels)) => {
                     if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
@@ -2419,7 +2423,7 @@ impl State {
         // elements, so they need to be updated.
         self.niri.update_xray_render_elements(output);
 
-        crate::with_primary_renderer_any!(self.backend, |renderer| {
+        crate::with_output_renderer_any!(self.backend, output, |renderer| {
             if let Some(output) = output {
                 let mut ctx = RenderCtx {
                     target: RenderTarget::Output,
@@ -2495,32 +2499,23 @@ impl State {
     ) {
         let _span = tracy_client::span!("TakeScreenshot");
 
-        let rv = crate::with_primary_renderer_any!(self.backend, |renderer| {
-            let on_done = {
-                let to_screenshot = to_screenshot.clone();
-                move |path| {
-                    let msg = NiriToScreenshot::ScreenshotResult(Some(path));
-                    if let Err(err) = to_screenshot.send_blocking(msg) {
-                        warn!("error sending path to screenshot: {err:?}");
-                    }
-                }
-            };
-
-            let res = self
-                .niri
-                .screenshot_all_outputs(renderer, include_cursor, on_done);
-
-            if let Err(err) = res {
-                warn!("error taking a screenshot: {err:?}");
-
-                let msg = NiriToScreenshot::ScreenshotResult(None);
+        let on_done = {
+            let to_screenshot = to_screenshot.clone();
+            move |path| {
+                let msg = NiriToScreenshot::ScreenshotResult(Some(path));
                 if let Err(err) = to_screenshot.send_blocking(msg) {
-                    warn!("error sending None to screenshot: {err:?}");
+                    warn!("error sending path to screenshot: {err:?}");
                 }
             }
-        });
+        };
 
-        if rv.is_none() {
+        let res = self
+            .niri
+            .screenshot_all_outputs(&mut self.backend, include_cursor, on_done);
+
+        if let Err(err) = res {
+            warn!("error taking a screenshot: {err:?}");
+
             let msg = NiriToScreenshot::ScreenshotResult(None);
             if let Err(err) = to_screenshot.send_blocking(msg) {
                 warn!("error sending None to screenshot: {err:?}");
@@ -5512,7 +5507,7 @@ impl Niri {
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
         self.send_frame_callbacks(output);
-        crate::with_primary_renderer_any!(backend, |renderer| {
+        crate::with_output_renderer_any!(backend, Some(output), |renderer| {
             #[cfg(feature = "xdp-gnome-screencast")]
             {
                 // Render and send to PipeWire screencast streams.
@@ -6833,95 +6828,96 @@ impl Niri {
         self.queue_redraw_all();
     }
 
-    pub fn capture_screenshots<'a, R: NiriCaptureRenderer>(
-        &'a self,
-        renderer: &'a mut R,
-    ) -> impl Iterator<Item = (Output, [OutputScreenshot; 3])> + 'a
-    where
-        PointerRenderElements<R>: RenderElement<R>,
-        TileRenderElement<R>: RenderElement<R>,
-        WindowMruUiRenderElement<R>: RenderElement<R>,
-        MinimizedStripRenderElement<R>: RenderElement<R>,
-        LayoutElementRenderElement<R>: RenderElement<R>,
-        UniversalTextureRenderElement: RenderElement<R>,
-        R::Error: Send + Sync + 'static,
-        OutputRenderElements<R>: RenderElement<R>,
-    {
-        self.global_space.outputs().cloned().filter_map(|output| {
-            let size = output.current_mode().unwrap().size;
-            let transform = output.current_transform();
-            let size = transform.transform_size(size);
+    pub fn capture_screenshots(
+        &self,
+        backend: &mut Backend,
+    ) -> HashMap<Output, [OutputScreenshot; 3]> {
+        self.global_space
+            .outputs()
+            .cloned()
+            .filter_map(|output| {
+                let screenshot =
+                    crate::with_output_renderer_any!(backend, Some(&output), |renderer| {
+                        let size = output.current_mode().unwrap().size;
+                        let transform = output.current_transform();
+                        let size = transform.transform_size(size);
 
-            let scale = Scale::from(output.current_scale().fractional_scale());
-            let targets = [
-                RenderTarget::Output,
-                RenderTarget::Screencast,
-                RenderTarget::ScreenCapture,
-            ];
-            let screenshot = targets.map(|target| {
-                let ctx = RenderCtx {
-                    renderer,
-                    target,
-                    xray: None,
-                };
-                let elements = self.render_to_vec(ctx, &output, false);
-                let elements = elements.iter().rev();
+                        let scale = Scale::from(output.current_scale().fractional_scale());
+                        let targets = [
+                            RenderTarget::Output,
+                            RenderTarget::Screencast,
+                            RenderTarget::ScreenCapture,
+                        ];
+                        let screenshot = targets.map(|target| {
+                            let ctx = RenderCtx {
+                                renderer,
+                                target,
+                                xray: None,
+                            };
+                            let elements = self.render_to_vec(ctx, &output, false);
+                            let elements = elements.iter().rev();
 
-                let res = render_to_texture(
-                    renderer,
-                    size,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elements,
-                );
-                if let Err(err) = &res {
-                    warn!("error rendering output {}: {err:?}", output.name());
-                }
-                let res_output = res.ok();
+                            let res = render_to_texture(
+                                renderer,
+                                size,
+                                scale,
+                                Transform::Normal,
+                                Fourcc::Abgr8888,
+                                elements,
+                            );
+                            if let Err(err) = &res {
+                                warn!("error rendering output {}: {err:?}", output.name());
+                            }
+                            let res_output = res.ok();
 
-                let mut pointer = Vec::new();
+                            let mut pointer = Vec::new();
 
-                // We check the pointer visibility for Disabled (and not .is_visible()) in order to
-                // show the pointer even when it's hidden through cursor {} options. The user can
-                // then toggle it in the screenshot UI as needed.
-                if self.pointer_visibility != PointerVisibility::Disabled {
-                    self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
-                }
+                            // We check the pointer visibility for Disabled (and not .is_visible())
+                            // in order to show the pointer even when
+                            // it's hidden through cursor {} options. The user can
+                            // then toggle it in the screenshot UI as needed.
+                            if self.pointer_visibility != PointerVisibility::Disabled {
+                                self.render_pointer(renderer, &output, &mut |elem| {
+                                    pointer.push(elem)
+                                });
+                            }
 
-                let res_pointer = if pointer.is_empty() {
-                    None
-                } else {
-                    let res = render_to_encompassing_texture(
-                        renderer,
-                        scale,
-                        Transform::Normal,
-                        Fourcc::Abgr8888,
-                        &pointer,
-                    );
-                    if let Err(err) = &res {
-                        warn!("error rendering pointer for {}: {err:?}", output.name());
-                    }
-                    res.ok()
-                };
+                            let res_pointer = if pointer.is_empty() {
+                                None
+                            } else {
+                                let res = render_to_encompassing_texture(
+                                    renderer,
+                                    scale,
+                                    Transform::Normal,
+                                    Fourcc::Abgr8888,
+                                    &pointer,
+                                );
+                                if let Err(err) = &res {
+                                    warn!("error rendering pointer for {}: {err:?}", output.name());
+                                }
+                                res.ok()
+                            };
 
-                res_output.map(|(texture, _)| {
-                    OutputScreenshot::from_textures(
-                        renderer,
-                        scale,
-                        texture,
-                        res_pointer.map(|(texture, _, geo)| (texture, geo)),
-                    )
-                })
-            });
+                            res_output.map(|(texture, _)| {
+                                OutputScreenshot::from_textures(
+                                    renderer,
+                                    scale,
+                                    texture,
+                                    res_pointer.map(|(texture, _, geo)| (texture, geo)),
+                                )
+                            })
+                        });
 
-            if screenshot.iter().any(|res| res.is_none()) {
-                return None;
-            }
-
-            let screenshot = screenshot.map(|res| res.unwrap());
-            Some((output, screenshot))
-        })
+                        if screenshot.iter().any(|res| res.is_none()) {
+                            None
+                        } else {
+                            Some(screenshot.map(|res| res.unwrap()))
+                        }
+                    })
+                    .flatten()?;
+                Some((output, screenshot))
+            })
+            .collect()
     }
 
     pub fn screenshot<R: NiriCaptureRenderer>(
@@ -7152,21 +7148,12 @@ impl Niri {
     }
 
     #[cfg(feature = "dbus")]
-    pub fn screenshot_all_outputs<R: NiriCaptureRenderer>(
+    pub fn screenshot_all_outputs(
         &mut self,
-        renderer: &mut R,
+        backend: &mut Backend,
         include_pointer: bool,
         on_done: impl FnOnce(PathBuf) + Send + 'static,
-    ) -> anyhow::Result<()>
-    where
-        UniversalTextureRenderElement: RenderElement<R>,
-        LayoutElementRenderElement<R>: RenderElement<R>,
-        R::Error: Send + Sync + 'static,
-        OutputRenderElements<R>: RenderElement<R>,
-        WindowMruUiRenderElement<R>: RenderElement<R>,
-        MinimizedStripRenderElement<R>: RenderElement<R>,
-        TileRenderElement<R>: RenderElement<R>,
-    {
+    ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_all_outputs");
 
         self.update_render_elements(None);
@@ -7197,23 +7184,26 @@ impl Niri {
             let size = transform.transform_size(size);
 
             let scale = output.current_scale().fractional_scale();
-            set_sdr_capture_blend(renderer, self.output_capture_reference_luminance(output));
-            let ctx = RenderCtx {
-                renderer,
-                target: RenderTarget::ScreenCapture,
-                xray: None,
-            };
-            let elements = self.render_to_vec(ctx, output, include_pointer);
+            let pixels = crate::with_output_renderer_any!(backend, Some(output), |renderer| {
+                set_sdr_capture_blend(renderer, self.output_capture_reference_luminance(output));
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::ScreenCapture,
+                    xray: None,
+                };
+                let elements = self.render_to_vec(ctx, output, include_pointer);
 
-            let pixels = render_to_vec(
-                renderer,
-                size,
-                Scale::from(scale),
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elements.iter().rev(),
-            )
-            .context("error rendering")?;
+                render_to_vec(
+                    renderer,
+                    size,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )
+                .context("error rendering")
+            })
+            .context("no renderer for output")??;
 
             let dst = Rectangle::new(
                 loc.to_f64().to_physical_precise_round(screenshot_scale),
@@ -7679,19 +7669,7 @@ impl Niri {
         }
     }
 
-    pub fn do_screen_transition<R: NiriCaptureRenderer>(
-        &mut self,
-        renderer: &mut R,
-        delay_ms: Option<u16>,
-    ) where
-        TileRenderElement<R>: RenderElement<R>,
-        WindowMruUiRenderElement<R>: RenderElement<R>,
-        MinimizedStripRenderElement<R>: RenderElement<R>,
-        LayoutElementRenderElement<R>: RenderElement<R>,
-        UniversalTextureRenderElement: RenderElement<R>,
-        R::Error: Send + Sync + 'static,
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    pub fn do_screen_transition(&mut self, backend: &mut Backend, delay_ms: Option<u16>) {
         let _span = tracy_client::span!("Niri::do_screen_transition");
 
         self.update_render_elements(None);
@@ -7701,55 +7679,65 @@ impl Niri {
             .keys()
             .cloned()
             .filter_map(|output| {
-                let size = output.current_mode().unwrap().size;
-                let transform = output.current_transform();
+                let textures =
+                    crate::with_output_renderer_any!(backend, Some(&output), |renderer| {
+                        let size = output.current_mode().unwrap().size;
+                        let transform = output.current_transform();
 
-                let scale = Scale::from(output.current_scale().fractional_scale());
-                let targets = [
-                    RenderTarget::Output,
-                    RenderTarget::Screencast,
-                    RenderTarget::ScreenCapture,
-                ];
-                let textures = targets.map(|target| {
-                    let ctx = RenderCtx {
-                        renderer,
-                        target,
-                        xray: None,
-                    };
-                    let elements = self.render_to_vec(ctx, &output, false);
-                    let elements = elements.iter().rev();
+                        let scale = Scale::from(output.current_scale().fractional_scale());
+                        let targets = [
+                            RenderTarget::Output,
+                            RenderTarget::Screencast,
+                            RenderTarget::ScreenCapture,
+                        ];
+                        let textures = targets.map(|target| {
+                            let ctx = RenderCtx {
+                                renderer,
+                                target,
+                                xray: None,
+                            };
+                            let elements = self.render_to_vec(ctx, &output, false);
+                            let elements = elements.iter().rev();
 
-                    let res = render_to_texture(
-                        renderer,
-                        size,
-                        scale,
-                        transform,
-                        Fourcc::Abgr8888,
-                        elements,
-                    );
+                            let res = render_to_texture(
+                                renderer,
+                                size,
+                                scale,
+                                transform,
+                                Fourcc::Abgr8888,
+                                elements,
+                            );
 
-                    if let Err(err) = &res {
-                        warn!("error rendering output {}: {err:?}", output.name());
-                    }
+                            if let Err(err) = &res {
+                                warn!("error rendering output {}: {err:?}", output.name());
+                            }
 
-                    res
-                });
+                            res
+                        });
 
-                if textures.iter().any(|res| res.is_err()) {
-                    return None;
-                }
-
-                let textures = textures.map(|res| {
-                    let texture = res.unwrap().0;
-                    TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        transform,
-                        Vec::new(), // We want windows below to get frame callbacks.
-                    )
-                });
-
+                        if textures.iter().any(|res| res.is_err()) {
+                            None
+                        } else {
+                            Some(textures.map(|res| {
+                                let texture = res.unwrap().0;
+                                let mut buffer = TextureBuffer::from_texture(
+                                    renderer,
+                                    texture,
+                                    scale,
+                                    transform,
+                                    Vec::new(), // We want windows below to get frame callbacks.
+                                );
+                                if let Err(err) = buffer.make_portable(renderer) {
+                                    warn!(
+                                        "error sharing screen transition for {}: {err:?}",
+                                        output.name()
+                                    );
+                                }
+                                buffer
+                            }))
+                        }
+                    })
+                    .flatten()?;
                 Some((output, textures))
             })
             .collect();

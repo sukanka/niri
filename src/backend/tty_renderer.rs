@@ -5,8 +5,9 @@
 //! type, so only the frame, framebuffer, error and texture-mapping types need wrapping.
 //!
 //! The GLES-specific parts of niri (custom shaders, offscreen effects) reach the raw
-//! [`GlesRenderer`] through [`AsGlesRenderer`](super::super::render_helpers::renderer::AsGlesRenderer),
-//! which returns `None` on the Vulkan variant; the effects degrade gracefully in that case.
+//! [`GlesRenderer`] through
+//! [`AsGlesRenderer`](super::super::render_helpers::renderer::AsGlesRenderer), which returns `None`
+//! on the Vulkan variant; the effects degrade gracefully in that case.
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
@@ -17,8 +18,8 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::vulkan::VulkanBackend;
 use smithay::backend::renderer::multigpu::{
-    Error as MultiError, MultiFrame, MultiFramebuffer, MultiRenderer, MultiTexture,
-    MultiTextureMapping,
+    ApiDevice, Error as MultiError, GraphicsApi, MultiFrame, MultiFramebuffer, MultiRenderer,
+    MultiTexture, MultiTextureMapping,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
@@ -660,6 +661,14 @@ impl TtyGpuManager {
         matches!(self, TtyGpuManager::Vulkan(_))
     }
 
+    /// Checks buffer support without copying it to an arbitrary composition GPU.
+    pub fn validate_dmabuf_import(&mut self, dmabuf: &Dmabuf) -> bool {
+        match self {
+            TtyGpuManager::Gles(gpus) => validate_dmabuf_import(gpus, dmabuf),
+            TtyGpuManager::Vulkan(gpus) => validate_dmabuf_import(gpus, dmabuf),
+        }
+    }
+
     pub fn single_renderer(
         &mut self,
         node: &smithay::backend::drm::DrmNode,
@@ -733,6 +742,81 @@ impl TtyGpuManager {
             TtyGpuManager::Vulkan(gpus) => gpus.early_import(target, surface).map_err(Into::into),
         }
     }
+}
+
+fn validate_dmabuf_import<A: GraphicsApi>(
+    gpus: &mut smithay::backend::renderer::multigpu::GpuManager<A>,
+    dmabuf: &Dmabuf,
+) -> bool
+where
+    <A::Device as ApiDevice>::Renderer: ImportDma,
+{
+    use smithay::backend::drm::NodeType;
+
+    // Raw renderers cache imports until their Dmabuf handle disappears. Probe a
+    // separate handle to the same kernel buffer so validation on an unrelated
+    // GPU doesn't retain textures for the lifetime of the client's wl_buffer.
+    let probe = match dmabuf_import_probe(dmabuf) {
+        Ok(probe) => probe,
+        Err(err) => {
+            debug!("error preparing dma-buf import probe: {err}");
+            return false;
+        }
+    };
+
+    // linux-dmabuf v6 may provide a sampling-device hint using either node type.
+    // Older clients provide no hint; there is no general kernel API identifying
+    // the allocation GPU, and a successful cross-device import doesn't identify it.
+    let hint = dmabuf.node().map(|node| {
+        node.node_with_type(NodeType::Render)
+            .and_then(Result::ok)
+            .unwrap_or(node)
+    });
+    let devices = match gpus.devices_mut() {
+        Ok(devices) => devices,
+        Err(err) => {
+            debug!("error enumerating GPUs for dma-buf import: {err}");
+            return false;
+        }
+    };
+    let mut devices = devices.collect::<Vec<_>>();
+    devices.sort_by_key(|device| Some(*device.node()) != hint);
+
+    for device in devices {
+        let node = *device.node();
+        // Even a GPU without cross-device import support may own this buffer.
+        // Probe its native import rather than using that capability to skip it.
+        // Software renderers, which cannot safely probe foreign buffers on some
+        // drivers, are excluded when Tty registers the GPU.
+        match device.renderer_mut().import_dmabuf(&probe, None) {
+            Ok(texture) => {
+                drop(texture);
+                drop(probe);
+                if let Err(err) = device.renderer_mut().cleanup_texture_cache() {
+                    debug!(%node, "error cleaning up dma-buf import probe: {err}");
+                }
+                // Keep valid explicit hints. With no hint, defer choosing the source to
+                // actual rendering, where MultiRenderer tries the output GPU first.
+                // Pinning the first successful importer here would cause unnecessary
+                // copies when the buffer is displayed on a different GPU.
+                dmabuf.set_node((Some(node) == hint).then_some(node));
+                return true;
+            }
+            Err(err) => trace!(%node, "dma-buf import is unsupported: {err}"),
+        }
+    }
+
+    false
+}
+
+fn dmabuf_import_probe(dmabuf: &Dmabuf) -> std::io::Result<Dmabuf> {
+    let mut builder = Dmabuf::builder_from_buffer(dmabuf, dmabuf.flags());
+    for ((fd, offset), stride) in dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides()) {
+        builder.add_plane(fd.try_clone_to_owned()?, offset, stride);
+    }
+    builder.build().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "dma-buf has no planes")
+    })
 }
 
 /// Universal texture holder of the renderer abstraction.
@@ -831,5 +915,49 @@ impl Bind<TtyOffscreen> for TtyRenderer<'_> {
             }
             _ => unreachable!("mismatched TtyRenderer and TtyOffscreen variants"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use smithay::backend::allocator::{Buffer, Fourcc, Modifier};
+
+    use super::dmabuf_import_probe;
+
+    #[test]
+    fn dmabuf_probe_preserves_metadata_without_extending_import_cache_lifetime() {
+        // Only the Dmabuf handle metadata is exercised, so no GPU allocation or
+        // real dma-buf is needed for this regression test.
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let mut builder = Dmabuf::builder(
+            (32, 16),
+            Fourcc::Argb8888,
+            Modifier::Linear,
+            DmabufFlags::Y_INVERT,
+        );
+        builder.add_plane(fd, 128, 256);
+        let original = builder.build().unwrap();
+        let original_weak = original.weak();
+        let probe = dmabuf_import_probe(&original).unwrap();
+        let probe_weak = probe.weak();
+
+        assert_ne!(original, probe);
+        assert_eq!(probe.size(), original.size());
+        assert_eq!(probe.format(), original.format());
+        assert_eq!(probe.flags(), original.flags());
+        assert_eq!(probe.offsets().collect::<Vec<_>>(), vec![128]);
+        assert_eq!(probe.strides().collect::<Vec<_>>(), vec![256]);
+        assert_ne!(
+            probe.handles().next().unwrap().as_raw_fd(),
+            original.handles().next().unwrap().as_raw_fd(),
+        );
+
+        drop(probe);
+        assert!(probe_weak.is_gone());
+        assert!(!original_weak.is_gone());
+        assert_eq!(original.node(), None);
     }
 }
