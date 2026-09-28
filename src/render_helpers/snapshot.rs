@@ -8,10 +8,28 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use super::{render_to_encompassing_texture, ToRenderElement};
 use crate::backend::tty_renderer::TtyOffscreen;
 use crate::render_helpers::renderer::NiriCaptureRenderer;
+use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 
 /// Rendered-to-texture contents cache of one snapshot variant.
-pub type SnapshotTexture = OnceCell<Option<(TtyOffscreen, Rectangle<i32, Physical>)>>;
+pub type SnapshotTexture =
+    OnceCell<Option<(TextureBuffer<TtyOffscreen>, Rectangle<i32, Physical>)>>;
+
+/// Caches frozen pixels before their source GPU can disappear (e.g. when unplugging an output).
+pub fn baked_texture<R: NiriCaptureRenderer>(
+    renderer: &mut R,
+    scale: Scale<f64>,
+    texture: Option<(TtyOffscreen, Rectangle<i32, Physical>)>,
+) -> SnapshotTexture {
+    OnceCell::from(texture.map(|(texture, geo)| {
+        let mut buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        if let Err(err) = buffer.make_portable(renderer) {
+            warn!("error preserving snapshot for another GPU: {err:#}");
+        }
+        (buffer, geo)
+    }))
+}
 
 /// Snapshot of a render.
 #[derive(Debug)]
@@ -48,35 +66,45 @@ pub struct RenderSnapshot<C, B> {
     pub blocked_out_texture: SnapshotTexture,
 }
 
-fn bake<'a, R, E>(
-    cell: &'a SnapshotTexture,
+fn bake<R, E>(
+    cell: &SnapshotTexture,
     elements: impl FnOnce() -> Vec<E>,
     renderer: &mut R,
     scale: Scale<f64>,
-) -> Option<&'a (TtyOffscreen, Rectangle<i32, Physical>)>
+) -> Option<(TtyOffscreen, Rectangle<i32, Physical>)>
 where
     R: NiriCaptureRenderer,
     R::Error: Send + Sync + 'static,
     E: RenderElement<R>,
 {
-    cell.get_or_init(|| {
-        let _span = tracy_client::span!("RenderSnapshot::texture");
+    let (buffer, geo) = cell
+        .get_or_init(|| {
+            let _span = tracy_client::span!("RenderSnapshot::texture");
 
-        match render_to_encompassing_texture(
-            renderer,
-            scale,
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            &elements(),
-        ) {
-            Ok((texture, _sync_point, geo)) => Some((texture, geo)),
-            Err(err) => {
-                warn!("error rendering snapshot contents to texture: {err:?}");
-                None
+            match render_to_encompassing_texture(
+                renderer,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                &elements(),
+            ) {
+                Ok((texture, _sync_point, geo)) => {
+                    baked_texture(renderer, scale, Some((texture, geo)))
+                        .into_inner()
+                        .flatten()
+                }
+                Err(err) => {
+                    warn!("error rendering snapshot contents to texture: {err:?}");
+                    None
+                }
             }
-        }
-    })
-    .as_ref()
+        })
+        .as_ref()?;
+    let texture = buffer
+        .texture_for_renderer(renderer)
+        .map_err(|err| warn!("error importing snapshot on another GPU: {err:#}"))
+        .ok()?;
+    Some((texture, *geo))
 }
 
 impl<C, B, EC, EB> RenderSnapshot<C, B>
@@ -89,7 +117,7 @@ where
         &self,
         renderer: &mut R,
         scale: Scale<f64>,
-    ) -> Option<&(TtyOffscreen, Rectangle<i32, Physical>)>
+    ) -> Option<(TtyOffscreen, Rectangle<i32, Physical>)>
     where
         R: NiriCaptureRenderer,
         R::Error: Send + Sync + 'static,
@@ -115,7 +143,7 @@ where
         &self,
         renderer: &mut R,
         scale: Scale<f64>,
-    ) -> Option<&(TtyOffscreen, Rectangle<i32, Physical>)>
+    ) -> Option<(TtyOffscreen, Rectangle<i32, Physical>)>
     where
         R: NiriCaptureRenderer,
         R::Error: Send + Sync + 'static,
@@ -142,7 +170,7 @@ where
         &self,
         renderer: &mut R,
         scale: Scale<f64>,
-    ) -> Option<&(TtyOffscreen, Rectangle<i32, Physical>)>
+    ) -> Option<(TtyOffscreen, Rectangle<i32, Physical>)>
     where
         R: NiriCaptureRenderer,
         R::Error: Send + Sync + 'static,
@@ -167,7 +195,7 @@ where
         &self,
         ctx: RenderCtx<R>,
         scale: Scale<f64>,
-    ) -> Option<&(TtyOffscreen, Rectangle<i32, Physical>)>
+    ) -> Option<(TtyOffscreen, Rectangle<i32, Physical>)>
     where
         R: NiriCaptureRenderer,
         R::Error: Send + Sync + 'static,

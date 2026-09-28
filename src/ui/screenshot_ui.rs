@@ -1036,14 +1036,18 @@ impl OutputScreenshot {
         texture: TtyOffscreen,
         pointer: Option<(TtyOffscreen, Rectangle<i32, Physical>)>,
     ) -> Self {
+        let mut buffer = TextureBuffer::from_texture(
+            renderer,
+            texture.clone(),
+            scale,
+            Transform::Normal,
+            Vec::new(),
+        );
+        if let Err(err) = buffer.make_portable(renderer) {
+            warn!("error preserving screenshot for another GPU: {err:#}");
+        }
         let buffer = UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
-            TextureBuffer::from_texture(
-                renderer,
-                texture.clone(),
-                scale,
-                Transform::Normal,
-                Vec::new(),
-            ),
+            buffer,
             (0., 0.),
             1.,
             None,
@@ -1052,14 +1056,18 @@ impl OutputScreenshot {
         ));
 
         let pointer = pointer.map(|(texture, geo)| {
+            let mut buffer = TextureBuffer::from_texture(
+                renderer,
+                texture,
+                scale,
+                Transform::Normal,
+                Vec::new(),
+            );
+            if let Err(err) = buffer.make_portable(renderer) {
+                warn!("error preserving screenshot pointer for another GPU: {err:#}");
+            }
             UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                ),
+                buffer,
                 geo.to_f64().to_logical(scale).loc,
                 1.,
                 None,

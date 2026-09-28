@@ -115,9 +115,9 @@ impl ClosingWindow {
         let (texture, geo) = snapshot
             .contents_texture(renderer, scale)
             .context("error rendering contents")?;
-        let (texture, geo) = (texture.clone(), *geo);
-        let buffer =
+        let mut buffer =
             TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        buffer.make_portable(renderer)?;
         let buffer_offset = geo.loc.to_f64().to_logical(scale);
 
         let (buffer_with_blocked_out_bg, buffer_with_blocked_out_bg_offset) =
@@ -125,14 +125,14 @@ impl ClosingWindow {
                 let (texture, geo) = snapshot
                     .contents_with_blocked_out_bg_texture(renderer, scale)
                     .context("error rendering contents with blocked-out bg")?;
-                let (texture, geo) = (texture.clone(), *geo);
-                let buffer = TextureBuffer::from_texture(
+                let mut buffer = TextureBuffer::from_texture(
                     renderer,
                     texture,
                     scale,
                     Transform::Normal,
                     Vec::new(),
                 );
+                buffer.make_portable(renderer)?;
                 (Some(buffer), geo.loc.to_f64().to_logical(scale))
             } else {
                 (None, Point::default())
@@ -141,9 +141,9 @@ impl ClosingWindow {
         let (texture, geo) = snapshot
             .blocked_out_texture(renderer, scale)
             .context("error rendering blocked-out contents")?;
-        let (texture, geo) = (texture.clone(), *geo);
-        let blocked_out_buffer =
+        let mut blocked_out_buffer =
             TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        blocked_out_buffer.make_portable(renderer)?;
         let blocked_out_buffer_offset = geo.loc.to_f64().to_logical(scale);
 
         Ok(Self {
@@ -254,25 +254,28 @@ impl ClosingWindow {
             let geo_to_tex =
                 Mat3::from_translation(-tex_loc / tex_size) * Mat3::from_scale(geo_size / tex_size);
 
-            return ShaderRenderElement::new(
-                ProgramType::Close,
-                view_rect.size,
-                None,
-                scale.x as f32,
-                1.,
-                Rc::new([
-                    mat3_uniform("niri_input_to_geo", input_to_geo),
-                    Uniform::new("niri_geo_size", geo_size.to_array()),
-                    mat3_uniform("niri_geo_to_tex", geo_to_tex),
-                    Uniform::new("niri_progress", progress as f32),
-                    Uniform::new("niri_clamped_progress", clamped_progress as f32),
-                    Uniform::new("niri_random_seed", self.random_seed),
-                ]),
-                HashMap::from([(String::from("niri_tex"), buffer.texture().clone())]),
-                Kind::Unspecified,
-            )
-            .with_location(Point::from((0., 0.)))
-            .into();
+            let texture = buffer.texture_for_renderer(ctx.renderer);
+            if let Ok(texture) = texture {
+                return ShaderRenderElement::new(
+                    ProgramType::Close,
+                    view_rect.size,
+                    None,
+                    scale.x as f32,
+                    1.,
+                    Rc::new([
+                        mat3_uniform("niri_input_to_geo", input_to_geo),
+                        Uniform::new("niri_geo_size", geo_size.to_array()),
+                        mat3_uniform("niri_geo_to_tex", geo_to_tex),
+                        Uniform::new("niri_progress", progress as f32),
+                        Uniform::new("niri_clamped_progress", clamped_progress as f32),
+                        Uniform::new("niri_random_seed", self.random_seed),
+                    ]),
+                    HashMap::from([(String::from("niri_tex"), texture)]),
+                    Kind::Unspecified,
+                )
+                .with_location(Point::from((0., 0.)))
+                .into();
+            }
         }
 
         let elem = TextureRenderElement::from_texture_buffer(

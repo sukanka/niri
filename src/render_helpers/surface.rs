@@ -1,15 +1,15 @@
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::utils::{import_surface, RendererSurfaceStateUserData};
-use smithay::backend::renderer::{ImportAll, Renderer};
+use smithay::backend::renderer::{ImportAll, Renderer, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Physical, Point, Scale};
+use smithay::utils::{Logical, Physical, Point, Scale, Transform};
 use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
 use super::blend::{BlendSurfaceRenderElement, ContentColor};
 use super::renderer::NiriRenderer;
-use super::texture::TextureBuffer;
+use super::texture::{needs_portable_textures, TextureBuffer, TextureRenderElement};
 use super::BakedBuffer;
 use crate::backend::tty_renderer::TtyOffscreen;
 
@@ -62,14 +62,58 @@ pub fn render_snapshot_from_surface_tree<R: NiriRenderer>(
                     return;
                 };
 
-                let buffer = TextureBuffer::from_texture(
+                let texture = if needs_portable_textures(renderer) {
+                    // Render through the full renderer, including MultiFrame's synchronization
+                    // and import preparation. Reading a MultiTexture's native cache directly
+                    // can miss a pending DMA fence or a not-yet-uploaded memory mapping.
+                    let source = TextureBuffer::from_texture(
+                        renderer,
+                        texture.clone(),
+                        1.,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    let element = TextureRenderElement::from_texture_buffer(
+                        source,
+                        (0., 0.),
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    );
+                    let result = super::render_to_texture(
+                        renderer,
+                        texture
+                            .size()
+                            .to_logical(1, Transform::Normal)
+                            .to_physical(1),
+                        Scale::from(1.),
+                        Transform::Normal,
+                        texture
+                            .format()
+                            .unwrap_or(smithay::backend::allocator::Fourcc::Abgr8888),
+                        std::iter::once(element),
+                    );
+                    match result {
+                        Ok((texture, _sync)) => texture,
+                        Err(err) => {
+                            warn!("error freezing surface snapshot: {err:#}");
+                            return;
+                        }
+                    }
+                } else {
+                    R::wrap_texture(texture.clone())
+                };
+                let mut buffer = TextureBuffer::from_texture(
                     renderer,
-                    texture.clone(),
+                    texture,
                     f64::from(data.buffer_scale()),
                     data.buffer_transform(),
                     Vec::new(),
-                )
-                .map_texture(R::wrap_texture);
+                );
+                if let Err(err) = buffer.make_portable(renderer) {
+                    warn!("error preserving surface snapshot for another GPU: {err:#}");
+                }
 
                 let baked = BakedBuffer {
                     buffer,

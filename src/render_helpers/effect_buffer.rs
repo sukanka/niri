@@ -51,8 +51,7 @@ enum Elements {
 /// Per-frame xray contents, typed for the raw renderer that created them.
 ///
 /// The TTY renderer enum borrows the GPU manager and cannot be stored, so contents are
-/// captured with the raw primary renderer (which is `'static`), like the GLES path always
-/// did.
+/// captured with the output's raw renderer (which is `'static`).
 #[derive(Debug)]
 pub enum ElementStore {
     Gles(Vec<LayerSurfaceRenderElement<GlesRenderer>>),
@@ -414,7 +413,12 @@ impl EffectBuffer {
             return Ok(());
         }
 
-        if self.blur.is_some() && !matches!(self.blur, Some(BlurVariant::Vulkan(_))) {
+        if let Some(BlurVariant::Vulkan(blur)) = &self.blur {
+            if blur.context_id() != renderer.context_id() {
+                debug!("recreating blur: renderer changed");
+                self.blur = None;
+            }
+        } else if self.blur.is_some() {
             debug!("recreating blur: renderer variant changed");
             self.blur = None;
         }

@@ -358,6 +358,7 @@ pub struct VulkanBlurProgram {
 /// buffer via [`VulkanFrame::render_custom_passes`].
 #[derive(Debug)]
 pub struct VulkanBlur {
+    renderer_context_id: ContextId<VulkanTexture>,
     program: VulkanBlurProgram,
     /// Output texture followed by intermediate textures, large to small.
     textures: Vec<VulkanTexture>,
@@ -367,9 +368,14 @@ impl VulkanBlur {
     pub fn new(renderer: &mut VulkanRenderer) -> Option<Self> {
         let program = renderer.user_data().get::<Shaders>()?.blur_vulkan.clone()?;
         Some(Self {
+            renderer_context_id: renderer.context_id(),
             program,
             textures: Vec::new(),
         })
+    }
+
+    pub fn context_id(&self) -> ContextId<VulkanTexture> {
+        self.renderer_context_id.clone()
     }
 
     pub fn prepare_textures(

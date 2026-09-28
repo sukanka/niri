@@ -1,5 +1,4 @@
 use core::f64;
-use std::cell::OnceCell;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
@@ -27,7 +26,7 @@ use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::snapshot::{baked_texture, RenderSnapshot};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
@@ -1600,11 +1599,11 @@ impl<W: LayoutElement> Tile<W> {
             blocked_out_contents: Vec::new(),
             block_out_from: self.window.rules().block_out_from,
             size: self.animated_tile_size(),
-            texture: OnceCell::from(texture),
+            texture: baked_texture(renderer, scale, texture),
             texture_with_blocked_out_bg: contents_with_blocked_out_bg
-                .map(OnceCell::from)
+                .map(|texture| baked_texture(renderer, scale, texture))
                 .unwrap_or_default(),
-            blocked_out_texture: OnceCell::from(blocked_out_texture),
+            blocked_out_texture: baked_texture(renderer, scale, blocked_out_texture),
         }
     }
 
