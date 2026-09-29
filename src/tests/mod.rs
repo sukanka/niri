@@ -11,6 +11,7 @@ mod floating;
 mod fullscreen;
 mod layer_shell;
 mod locking;
+mod multigpu_sync;
 mod remove_output;
 mod shader_runtime;
 mod suspended;

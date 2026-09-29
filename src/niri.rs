@@ -1,7 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::os::unix::io::BorrowedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -5803,21 +5802,32 @@ impl Niri {
         }
     }
 
-    /// Stamps the frame's render fence onto the buffers of all surfaces on this output.
+    /// Publishes completion of this frame's reads before clients can reuse their buffers.
     ///
-    /// Explicit-sync release points then signal on GPU completion of the frame that last
-    /// sampled the buffer, rather than immediately when the buffer is replaced. Stamping is
-    /// deliberately unfiltered: for surfaces that were direct scanned out or skipped this
-    /// frame, the fence is merely conservative (this frame's rendering finishes no earlier
-    /// than any previous read on the same context), and buffers without a release point
-    /// ignore it.
-    pub fn stamp_release_fences(&self, output: &Output, fence: BorrowedFd<'_>) {
-        self.for_each_output_surface(output, |_, states| {
-            if let Some(state) = states.data_map.get::<RendererSurfaceStateUserData>() {
-                if let Some(buffer) = state.lock().unwrap().buffer() {
-                    buffer.set_release_fence(fence);
+    /// Explicit clients receive release fences, and implicit clients receive READ fences in
+    /// every DMA-BUF plane's reservation object. The conservative surface traversal also
+    /// includes hidden and scanned-out buffers; adding a rendering dependency is harmless.
+    /// If fence export or import fails, wait for this submission before allowing release.
+    pub fn stamp_release_fences(&self, output: &Output, sync: &SyncPoint) {
+        use crate::render_helpers::dmabuf_sync::{import_read_fence, with_read_fence};
+
+        with_read_fence(sync, |fence| {
+            let mut result = Ok(());
+            self.for_each_output_surface(output, |_, states| {
+                if let Some(state) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                    if let Some(buffer) = state.lock().unwrap().buffer() {
+                        buffer.set_release_fence(fence);
+                        // Once an import fails we will wait for the entire frame, so no more
+                        // implicit imports are needed. Keep stamping explicit release points.
+                        if result.is_ok() {
+                            if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(buffer) {
+                                result = import_read_fence(dmabuf, fence);
+                            }
+                        }
+                    }
                 }
-            }
+            });
+            result
         });
     }
 

@@ -194,6 +194,8 @@ First, install the dependencies for your distribution.
 
 Next, get latest stable Rust: https://rustup.rs/
 
+This checkout's existing `../smithay` dependency should use the [`fix/multigpu-buffer-sync` branch of sukanka/smithay](https://github.com/sukanka/smithay/tree/fix/multigpu-buffer-sync).
+
 Then, build niri with `cargo build --release`.
 
 Check Cargo.toml for a list of build features.

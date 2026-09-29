@@ -2737,14 +2737,12 @@ impl Tty {
                     }
                 }
 
-                // Stamp the frame's render fence onto the sampled buffers, so explicit-sync
-                // release points signal on GPU completion rather than on buffer replacement.
-                if niri.syncobj_state.is_some() && !res.is_empty {
+                // Both implicit and explicit clients must wait until composition has
+                // finished sampling their buffers before reusing them.
+                if !res.is_empty {
                     if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
-                        let _span = tracy_client::span!("export release fence");
-                        if let Some(fence) = element.sync.export() {
-                            niri.stamp_release_fences(output, fence.as_fd());
-                        }
+                        let _span = tracy_client::span!("publish buffer read fences");
+                        niri.stamp_release_fences(output, &element.sync);
                     }
                 }
 

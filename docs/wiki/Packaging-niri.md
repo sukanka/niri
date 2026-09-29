@@ -4,6 +4,8 @@ When building niri, check `Cargo.toml` for a list of build features.
 For example, you can replace systemd integration with dinit integration using `cargo build --release --no-default-features --features dinit,dbus,xdp-gnome-screencast`.
 The defaults however should work fine for most distributions.
 
+Use the [`fix/multigpu-buffer-sync` branch of sukanka/smithay](https://github.com/sukanka/smithay/tree/fix/multigpu-buffer-sync) for this checkout's existing local `../smithay` dependency.
+
 > [!WARNING]
 > Do NOT build with `--all-features`!
 >
@@ -50,6 +52,21 @@ Working hardware acceleration is required for running niri.
 Finally, you may want to auto-install some of the applications bound in niri's [default configuration file](https://github.com/niri-wm/niri/blob/main/resources/default-config.kdl) (search for `spawn`), such as `alacritty` and `fuzzel`.
 
 ### Running tests
+
+A successful build alone does not verify cross-GPU buffer synchronization.
+For the per-output renderer, also run the hardware regression test with two accessible DRM render devices:
+
+```sh
+env -u __EGL_VENDOR_LIBRARY_FILENAMES \
+    NIRI_MULTIGPU_SOURCE=/dev/dri/renderD128 NIRI_MULTIGPU_TARGET=/dev/dri/renderD129 \
+    cargo test --lib tests::multigpu_sync::cross_gpu_client_buffer_reuse -- --exact --ignored --nocapture
+```
+
+Set the source and target paths to the actual GPUs used by the client and output compositor.
+Both EGL drivers must be available to the test, so its command clears any single-vendor override.
+Repeat with `NIRI_MULTIGPU_NATIVE=1` to test the source GPU's native modifiers in addition to linear buffers.
+This test checks rendered pixels while reusing client and compositor buffers; software-only shader tests cannot reproduce the same DMA-BUF sharing races.
+After installing the package, also verify the lock screen and moving windows between the two GPUs in the running compositor.
 
 A bulk of our tests spawn niri compositor instances and test Wayland clients.
 This does not require a graphical session, however due to test parallelism, it can run into file descriptor limits on high core count systems.
