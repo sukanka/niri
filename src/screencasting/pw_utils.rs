@@ -35,7 +35,7 @@ use pipewire::sys::{pw_buffer, pw_check_library_version, pw_stream_queue_buffer}
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmBuffer, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::{Buffer as _, Format, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
@@ -626,6 +626,7 @@ impl PipeWire {
                                     format_size,
                                     fourcc,
                                     modifiers,
+                                    &formats,
                                 ) {
                                     Ok(x) => x,
                                     Err(err) => {
@@ -738,6 +739,7 @@ impl PipeWire {
                                         format_size,
                                         fourcc,
                                         vec![format.modifier() as i64],
+                                        &formats,
                                     ) {
                                         Ok(x) => x,
                                         Err(err) => {
@@ -884,10 +886,13 @@ impl PipeWire {
                 .add_buffer({
                     let inner = inner.clone();
                     let stop_cast = stop_cast.clone();
+                    let formats = formats.clone();
                     move |stream, (), buffer| {
                         let _span = debug_span!("add_buffer", %stream_id).entered();
 
-                        match unsafe { inner.borrow_mut().on_add_buffer(gbm.as_ref(), buffer) } {
+                        match unsafe {
+                            inner.borrow_mut().on_add_buffer(gbm.as_ref(), &formats, buffer)
+                        } {
                             Ok(redraw) => {
                                 // During size re-negotiation, the stream sometimes just keeps
                                 // running, in which case we may need to force a redraw once we got
@@ -1435,6 +1440,7 @@ impl CastInner {
     unsafe fn on_add_buffer(
         &mut self,
         gbm: Option<&GbmDevice<DeviceFd>>,
+        render_formats: &FormatSet,
         buffer: *mut pw_buffer,
     ) -> anyhow::Result<bool> {
         let CastState::Ready {
@@ -1469,12 +1475,19 @@ impl CastInner {
                         Fourcc::Xrgb8888
                     };
 
-                    let dmabuf = allocate_dmabuf(gbm, size, fourcc, modifier)
+                    let dmabuf = allocate_dmabuf(gbm, size, fourcc, modifier, render_formats)
                         .context("error allocating dmabuf")?;
 
                     let plane_count = dmabuf.num_planes();
                     assert_eq!((*spa_buffer).n_datas as usize, plane_count);
-                    debug!(?size, %fourcc, ?modifier, plane_count, "allocated screencast DMA-BUF");
+                    debug!(
+                        ?size,
+                        %fourcc,
+                        negotiated_modifier = ?modifier,
+                        import_modifier = ?dmabuf.format().modifier,
+                        plane_count,
+                        "allocated screencast DMA-BUF"
+                    );
 
                     for (i, (fd, (stride, offset))) in
                         zip(dmabuf.handles(), zip(dmabuf.strides(), dmabuf.offsets())).enumerate()
@@ -1625,10 +1638,11 @@ fn find_preferred_modifier(
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifiers: Vec<i64>,
+    render_formats: &FormatSet,
 ) -> anyhow::Result<(Modifier, usize)> {
     debug!("find_preferred_modifier: size={size:?}, fourcc={fourcc}, modifiers={modifiers:?}");
 
-    let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, &modifiers)?;
+    let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, &modifiers, render_formats)?;
 
     let dmabuf = buffer
         .export()
@@ -1640,11 +1654,14 @@ fn find_preferred_modifier(
     Ok((modifier, plane_count))
 }
 
+// The returned modifier describes the PipeWire negotiation. The buffer may carry
+// a supported explicit modifier for local rendering even when sharing is implicit.
 fn allocate_buffer(
     gbm: &GbmDevice<DeviceFd>,
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifiers: &[i64],
+    render_formats: &FormatSet,
 ) -> anyhow::Result<(GbmBuffer, Modifier)> {
     let (w, h) = (size.w, size.h);
     let flags = GbmBufferFlags::RENDERING;
@@ -1654,7 +1671,23 @@ fn allocate_buffer(
             .create_buffer_object::<()>(w, h, fourcc, flags)
             .context("error creating GBM buffer object")?;
 
-        let buffer = GbmBuffer::from_bo(bo, true);
+        // Keep the implicit modifier for PipeWire, but retain the allocation's
+        // actual layout for our own renderer when it supports that layout.
+        // In particular, NVIDIA may import an implicit EGLImage only as an
+        // external texture, which cannot be used as a rendering destination.
+        // Do not trust arbitrary modifiers reported by legacy GBM allocations:
+        // require this exact format/modifier in the renderer's bindable formats.
+        let allocated_modifier = bo.modifier();
+        let explicit_import = allocated_modifier != Modifier::Invalid
+            && render_formats.contains(&Format {
+                code: fourcc,
+                modifier: allocated_modifier,
+            });
+        debug!(
+            ?allocated_modifier,
+            explicit_import, "allocated implicit screencast buffer"
+        );
+        let buffer = GbmBuffer::from_bo(bo, !explicit_import);
         Ok((buffer, Modifier::Invalid))
     } else {
         let modifiers = modifiers
@@ -1677,8 +1710,15 @@ fn allocate_dmabuf(
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifier: Modifier,
+    render_formats: &FormatSet,
 ) -> anyhow::Result<Dmabuf> {
-    let (buffer, _modifier) = allocate_buffer(gbm, size, fourcc, &[u64::from(modifier) as i64])?;
+    let (buffer, _modifier) = allocate_buffer(
+        gbm,
+        size,
+        fourcc,
+        &[u64::from(modifier) as i64],
+        render_formats,
+    )?;
     let dmabuf = buffer
         .export()
         .context("error exporting GBM buffer object as dmabuf")?;
