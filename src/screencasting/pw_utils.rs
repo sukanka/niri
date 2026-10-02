@@ -603,7 +603,7 @@ impl PipeWire {
                             Some(prop_modifier)
                                 if prop_modifier.flags().contains(PodPropFlags::DONT_FIXATE) =>
                             {
-                                debug!("fixating the modifier");
+                                debug!(flags = ?prop_modifier.flags(), "fixating the modifier");
 
                                 let Some(gbm) = &gbm else {
                                     error!("negotiated dmabuf without gbm");
@@ -612,27 +612,20 @@ impl PipeWire {
                                 };
 
                                 let pod_modifier = prop_modifier.value();
-                                let Ok((_, modifiers)) =
-                                    PodDeserializer::deserialize_from::<Choice<i64>>(
-                                        pod_modifier.as_bytes(),
-                                    )
-                                else {
-                                    warn!("wrong modifier property type");
-                                    stop_cast();
-                                    return;
-                                };
-
-                                let ChoiceEnum::Enum { alternatives, .. } = modifiers.1 else {
-                                    warn!("wrong modifier choice type");
-                                    stop_cast();
-                                    return;
+                                let modifiers = match parse_modifier_candidates(pod_modifier) {
+                                    Ok(modifiers) => modifiers,
+                                    Err(err) => {
+                                        warn!("invalid modifier property: {err:?}");
+                                        stop_cast();
+                                        return;
+                                    }
                                 };
 
                                 let (modifier, plane_count) = match find_preferred_modifier(
                                     gbm,
                                     format_size,
                                     fourcc,
-                                    alternatives,
+                                    modifiers,
                                 ) {
                                     Ok(x) => x,
                                     Err(err) => {
@@ -1355,6 +1348,9 @@ impl Cast {
             drop(inner);
             match res {
                 Ok((sync_point, buf)) => {
+                    if self.sequence_counter == 0 {
+                        debug!(%self.stream_id, "rendered first screencast frame");
+                    }
                     mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, buf);
                     trace!("queueing buffer with seq={}", self.sequence_counter);
                     self.queue_after_sync(pw_buffer, sync_point);
@@ -1478,6 +1474,7 @@ impl CastInner {
 
                     let plane_count = dmabuf.num_planes();
                     assert_eq!((*spa_buffer).n_datas as usize, plane_count);
+                    debug!(?size, %fourcc, ?modifier, plane_count, "allocated screencast DMA-BUF");
 
                     for (i, (fd, (stride, offset))) in
                         zip(dmabuf.handles(), zip(dmabuf.strides(), dmabuf.offsets())).enumerate()
@@ -1598,6 +1595,29 @@ fn pw_version_supports_cursor_metadata() -> bool {
 fn make_pod(buffer: &mut Vec<u8>, object: pod::Object) -> &Pod {
     PodSerializer::serialize(Cursor::new(&mut *buffer), &pod::Value::Object(object)).unwrap();
     Pod::from_bytes(buffer).unwrap()
+}
+
+fn parse_modifier_candidates(pod: &Pod) -> anyhow::Result<Vec<i64>> {
+    let (_, value) = PodDeserializer::deserialize_from::<pod::Value>(pod.as_bytes())
+        .map_err(|err| anyhow::anyhow!("error parsing modifier property: {err:?}"))?;
+    debug!(?value, "negotiated modifier property");
+
+    let modifiers = match value {
+        // SPA can reduce an intersection to Choice_None while keeping DONT_FIXATE.
+        // A scalar Long is also a fixed value in SPA. Both still need test allocation,
+        // including DRM_FORMAT_MOD_INVALID, which requests an implicit layout.
+        pod::Value::Long(modifier)
+        | pod::Value::Choice(ChoiceValue::Long(Choice(_, ChoiceEnum::None(modifier)))) => {
+            vec![modifier]
+        }
+        pod::Value::Choice(ChoiceValue::Long(Choice(_, ChoiceEnum::Enum { alternatives, .. }))) => {
+            alternatives
+        }
+        _ => bail!("unexpected modifier property: {value:?}"),
+    };
+
+    ensure!(!modifiers.is_empty(), "empty modifier candidate list");
+    Ok(modifiers)
 }
 
 fn find_preferred_modifier(
@@ -1969,6 +1989,116 @@ fn clear_shmbuf(buffer: &Shmbuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modifier_candidates(value: pod::Value) -> anyhow::Result<Vec<i64>> {
+        let mut object =
+            make_video_params(VideoFormat::BGRx, &[], Size::from((3840, 2160)), 144_000);
+        object.properties.push(Property {
+            key: FormatProperties::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+            value,
+        });
+        let mut bytes = Vec::new();
+        let pod = make_pod(&mut bytes, object);
+        let object = pod.as_object().unwrap();
+        let property = object
+            .find_prop(spa::utils::Id(FormatProperties::VideoModifier.0))
+            .unwrap();
+        assert!(property.flags().contains(PodPropFlags::DONT_FIXATE));
+        parse_modifier_candidates(property.value())
+    }
+
+    #[test]
+    fn modifier_candidates_accept_single_values() {
+        // In particular, do not turn the implicit-layout marker into Linear or SHM.
+        for modifier in [0, 0x00ff_ffff_ffff_ffff, 0x0300_0000_0060_6010] {
+            let value = pod::Value::Choice(ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::None(modifier),
+            )));
+            assert_eq!(modifier_candidates(value).unwrap(), vec![modifier]);
+            assert_eq!(
+                modifier_candidates(pod::Value::Long(modifier)).unwrap(),
+                vec![modifier]
+            );
+        }
+    }
+
+    #[test]
+    fn modifier_candidates_accept_spa_filtered_pod() {
+        // SPA's filter produces this POD when two Enum lists intersect only at
+        // DRM_FORMAT_MOD_INVALID, even with DONT_FIXATE on both properties.
+        // Build the native-endian wire data independently of PodSerializer.
+        let header = [
+            24_u32,
+            SPA_TYPE_Choice,
+            SPA_CHOICE_None,
+            0,
+            8,
+            SPA_TYPE_Long,
+        ];
+        let bytes: Vec<u8> = header
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .chain(0x00ff_ffff_ffff_ffff_i64.to_ne_bytes())
+            .collect();
+        let pod = Pod::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            parse_modifier_candidates(pod).unwrap(),
+            vec![0x00ff_ffff_ffff_ffff]
+        );
+    }
+
+    #[test]
+    fn modifier_candidates_preserve_enum_alternatives() {
+        let alternatives = vec![0x0300_0000_0060_6010, 0, 0x00ff_ffff_ffff_ffff];
+        let value = pod::Value::Choice(ChoiceValue::Long(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                // The default is a preference, not an additional candidate.
+                default: 42,
+                alternatives: alternatives.clone(),
+            },
+        )));
+        assert_eq!(modifier_candidates(value).unwrap(), alternatives);
+    }
+
+    #[test]
+    fn modifier_candidates_reject_invalid_types_and_choices() {
+        assert!(modifier_candidates(pod::Value::Int(0)).is_err());
+        assert!(
+            modifier_candidates(pod::Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::None(0),
+            ))))
+            .is_err()
+        );
+
+        for choice in [
+            ChoiceEnum::Enum {
+                default: 0,
+                alternatives: vec![],
+            },
+            ChoiceEnum::Range {
+                default: 0,
+                min: 0,
+                max: 1,
+            },
+            ChoiceEnum::Step {
+                default: 0,
+                min: 0,
+                max: 1,
+                step: 1,
+            },
+            ChoiceEnum::Flags {
+                default: 0,
+                flags: vec![0],
+            },
+        ] {
+            let value = pod::Value::Choice(ChoiceValue::Long(Choice(ChoiceFlags::empty(), choice)));
+            assert!(modifier_candidates(value).is_err());
+        }
+    }
 
     #[test]
     fn shm_layout_uses_spa_representable_dimensions() {
