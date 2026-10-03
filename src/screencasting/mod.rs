@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use calloop::LoopHandle;
-use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::gbm::GbmDevice;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::Bind;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
+use smithay::utils::{Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
@@ -25,7 +25,7 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
-use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
+use pw_utils::{test_implicit_buffer, Cast, CastGbm, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
 use crate::layout::LayoutElementRenderElement;
 use crate::render_helpers::texture::UniversalTextureRenderElement;
@@ -87,7 +87,8 @@ impl State {
         &mut self,
         target: &CastTarget,
         dynamic_target: bool,
-    ) -> anyhow::Result<Option<(GbmDevice<DeviceFd>, FormatSet)>> {
+        size: Size<i32, Physical>,
+    ) -> anyhow::Result<Option<CastGbm>> {
         // Ensure PipeWire is initialized.
         if self.niri.casting.pipewire.is_none() {
             let pw = PipeWire::new(
@@ -115,18 +116,61 @@ impl State {
             CastTarget::Output { output, .. } => output.upgrade(),
             _ => None,
         };
-        let Some(gbm) = self.backend.gbm_device_for_output(output.as_ref()) else {
+        let Some(mut gbm) = self.backend.gbm_device_for_output(output.as_ref()) else {
             // We will offer shm only.
             return Ok(None);
         };
 
-        let mut render_formats = crate::with_output_renderer_any!(self.backend, output.as_ref(), |renderer| {
-            smithay::backend::renderer::Bind::<smithay::backend::allocator::dmabuf::Dmabuf>::supported_formats(
-                renderer,
-            )
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
+        let mut render_formats =
+            crate::with_output_renderer_any!(self.backend, output.as_ref(), |renderer| {
+                Bind::<Dmabuf>::supported_formats(renderer).unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        let mut render_on_primary = false;
+        if self.backend.render_on_output_device() {
+            if let Some(output) = output.as_ref() {
+                let output_node = self.backend.render_node_for_output(output);
+                let primary_node = self.backend.primary_render_node();
+                if matches!((output_node, primary_node), (Some(output), Some(primary)) if output != primary)
+                {
+                    let implicit_test =
+                        crate::with_output_renderer_any!(self.backend, Some(output), |renderer| {
+                            test_implicit_buffer(renderer, &gbm, size)
+                        })
+                        .context("output screencast renderer is unavailable")?;
+
+                    if let Err(err) = implicit_test {
+                        warn!(
+                            output = output.name(),
+                            "output GPU cannot render to an implicit screencast buffer; trying primary GPU: {err:?}"
+                        );
+                        let primary_gbm = self
+                            .backend
+                            .gbm_device()
+                            .context("primary screencast allocator is unavailable")?;
+                        let (primary_formats, primary_test) =
+                            crate::with_primary_renderer_any!(self.backend, |renderer| {
+                                (
+                                    Bind::<Dmabuf>::supported_formats(renderer).unwrap_or_default(),
+                                    test_implicit_buffer(renderer, &primary_gbm, size),
+                                )
+                            })
+                            .context("primary screencast renderer is unavailable")?;
+                        primary_test.context(
+                            "primary GPU cannot render to an implicit screencast buffer",
+                        )?;
+                        gbm = primary_gbm;
+                        render_formats = primary_formats;
+                        render_on_primary = true;
+                        debug!(
+                            output = output.name(),
+                            "using primary GPU for screencast allocation and rendering"
+                        );
+                    }
+                }
+            }
+        }
 
         {
             let config = self.niri.config.borrow();
@@ -138,7 +182,11 @@ impl State {
             }
         }
 
-        Ok(Some((gbm, render_formats)))
+        Ok(Some(CastGbm {
+            device: gbm,
+            formats: render_formats,
+            render_on_primary,
+        }))
     }
 
     pub fn on_pw_msg(&mut self, msg: PwToNiri) {
@@ -362,7 +410,7 @@ impl State {
             }
         };
 
-        let gbm = match self.prepare_pw_cast(target, true) {
+        let gbm = match self.prepare_pw_cast(target, true, size) {
             Ok(x) => x,
             Err(err) => {
                 warn!("error starting pending screencasts: {err:?}");
@@ -459,7 +507,7 @@ impl State {
                     }
                 };
 
-                let gbm = match self.prepare_pw_cast(&target, false) {
+                let gbm = match self.prepare_pw_cast(&target, false, size) {
                     Ok(x) => x,
                     Err(err) => {
                         warn!("error starting screencast: {err:?}");
@@ -565,6 +613,7 @@ impl Niri {
         renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
+        render_on_primary: bool,
     ) where
         UniversalTextureRenderElement: RenderElement<R>,
         LayoutElementRenderElement<R>: RenderElement<R>,
@@ -591,6 +640,9 @@ impl Niri {
 
         let mut casts = mem::take(&mut self.casting.casts);
         for cast in &mut casts {
+            if cast.render_on_primary != render_on_primary {
+                continue;
+            }
             if !cast.is_active() {
                 continue;
             }

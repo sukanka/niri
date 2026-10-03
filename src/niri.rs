@@ -5510,7 +5510,7 @@ impl Niri {
             #[cfg(feature = "xdp-gnome-screencast")]
             {
                 // Render and send to PipeWire screencast streams.
-                self.render_for_screen_cast(renderer, output, target_presentation_time);
+                self.render_for_screen_cast(renderer, output, target_presentation_time, false);
 
                 // FIXME: when a window is hidden, it should probably still receive frame callbacks
                 // and get rendered for screen cast. This is currently
@@ -5523,6 +5523,18 @@ impl Niri {
             self.render_for_image_copy_capture(renderer, output, target_presentation_time);
             self.render_for_image_copy_cursor_capture(renderer, output, target_presentation_time);
         });
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        {
+            let weak = output.downgrade();
+            if self.casting.casts.iter().any(|cast| {
+                cast.render_on_primary && cast.is_active() && cast.target.matches_output(&weak)
+            }) {
+                crate::with_primary_renderer_any!(backend, |renderer| {
+                    self.render_for_screen_cast(renderer, output, target_presentation_time, true);
+                });
+            }
+        }
     }
 
     pub fn refresh_on_demand_vrr(&mut self, backend: &mut Backend, output: &Output) {
