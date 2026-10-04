@@ -205,17 +205,13 @@ impl Blur {
             "output texture has a non-unique reference"
         );
 
-        renderer.with_profiled_context(gpu_span_location!("Blur::render"), |gl| unsafe {
+        renderer.with_profiled_framebuffer(gpu_span_location!("Blur::render"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
 
             gl.Disable(ffi::BLEND);
             gl.Disable(ffi::SCISSOR_TEST);
 
             gl.ActiveTexture(ffi::TEXTURE0);
-
-            let mut fbos = [0; 2];
-            gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
-            gl.BindFramebuffer(ffi::FRAMEBUFFER, fbos[0]);
 
             let program = &self.program.0.down;
             gl.UseProgram(program.program);
@@ -338,9 +334,6 @@ impl Blur {
             }
 
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
-
-            gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
-            gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
         })?;
 
         Ok(self.textures[0].clone())
@@ -532,5 +525,117 @@ impl VulkanBlur {
             .context("error rendering blur passes")?;
 
         Ok(self.textures[0].clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::backend::egl::native::EGLSurfacelessDisplay;
+    use smithay::backend::egl::{EGLContext, EGLDisplay};
+    use smithay::backend::renderer::{ExportMem as _, ImportMem as _};
+    use smithay::utils::Rectangle;
+
+    use super::*;
+
+    fn renderer() -> Option<GlesRenderer> {
+        let result = (|| -> anyhow::Result<_> {
+            let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay)? };
+            let context = EGLContext::new(&display)?;
+            Ok(unsafe { GlesRenderer::new(context)? })
+        })();
+        match result {
+            Ok(renderer) => Some(renderer),
+            Err(err) => {
+                if std::env::var_os("NIRI_TEST_REQUIRE_GPU")
+                    .is_some_and(|v| !v.is_empty() && v != "0")
+                {
+                    panic!("blur test requires GLES: {err:#}");
+                }
+                eprintln!("skipping blur test: {err:#}");
+                None
+            }
+        }
+    }
+
+    fn blur(renderer: &mut GlesRenderer) -> Blur {
+        Blur {
+            program: BlurProgram::compile(renderer).unwrap(),
+            renderer_context_id: renderer.context_id(),
+            textures: Vec::new(),
+        }
+    }
+
+    fn pixels(renderer: &mut GlesRenderer, texture: &GlesTexture) -> Vec<u8> {
+        let mapping = renderer
+            .copy_texture(
+                texture,
+                Rectangle::from_size(texture.size()),
+                Fourcc::Abgr8888,
+            )
+            .unwrap();
+        let result = renderer.map_texture(&mapping).unwrap().to_vec();
+        renderer
+            .with_context(|gl| assert_eq!(unsafe { gl.GetError() }, ffi::NO_ERROR))
+            .unwrap();
+        result
+    }
+
+    #[test]
+    fn repeated_blur_preserves_pixels_and_reuses_textures_after_readback() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let mut cached = blur(&mut renderer);
+        for (size, passes) in [((16, 12), 3), ((10, 8), 2), ((16, 12), 3)] {
+            let options = BlurOptions { passes, offset: 1. };
+            let data: Vec<_> = (0..size.0 * size.1)
+                .flat_map(|index| [(index * 19) as u8, (index * 7) as u8, 128, 255])
+                .collect();
+            let source = renderer
+                .import_memory(&data, Fourcc::Abgr8888, size.into(), false)
+                .unwrap();
+            let mut reference = blur(&mut renderer);
+            reference
+                .prepare_textures(
+                    |format, size| renderer.create_buffer(format, size),
+                    &source,
+                    options,
+                )
+                .unwrap();
+            let reference_output = reference.render(&mut renderer, &source, options).unwrap();
+            let expected = pixels(&mut renderer, &reference_output);
+            drop(reference_output);
+            reference.program.destroy(&mut renderer).unwrap();
+
+            cached
+                .prepare_textures(
+                    |format, size| renderer.create_buffer(format, size),
+                    &source,
+                    options,
+                )
+                .unwrap();
+            let ids: Vec<_> = cached.textures.iter().map(GlesTexture::tex_id).collect();
+            for _ in 0..8 {
+                cached
+                    .prepare_textures(
+                        |format, size| renderer.create_buffer(format, size),
+                        &source,
+                        options,
+                    )
+                    .unwrap();
+                let output = cached.render(&mut renderer, &source, options).unwrap();
+                assert_eq!(pixels(&mut renderer, &output), expected);
+                drop(output);
+                assert_eq!(
+                    cached
+                        .textures
+                        .iter()
+                        .map(GlesTexture::tex_id)
+                        .collect::<Vec<_>>(),
+                    ids
+                );
+            }
+        }
+        cached.program.destroy(&mut renderer).unwrap();
     }
 }
