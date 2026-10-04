@@ -34,7 +34,6 @@ use smithay::backend::renderer::element::{
     RenderElementStates,
 };
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::utils::{
     bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
@@ -5910,37 +5909,6 @@ impl Niri {
                 |_, _, _| true,
             );
         }
-    }
-
-    /// Publishes completion of this frame's reads before clients can reuse their buffers.
-    ///
-    /// Explicit clients receive release fences, and implicit clients receive READ fences in
-    /// every DMA-BUF plane's reservation object. The conservative surface traversal also
-    /// includes hidden and scanned-out buffers; adding a rendering dependency is harmless.
-    /// Shared DMA-BUFs only need one implicit import, but each buffer keeps its explicit fence.
-    /// If fence export or import fails, wait for this submission before allowing release.
-    pub fn stamp_release_fences(&self, output: &Output, sync: &SyncPoint) {
-        use crate::render_helpers::dmabuf_sync::{with_read_fence, ReadFenceImports};
-
-        with_read_fence(sync, |fence| {
-            let mut result = Ok(());
-            let mut imported = ReadFenceImports::default();
-            self.for_each_output_surface(output, |_, states| {
-                if let Some(state) = states.data_map.get::<RendererSurfaceStateUserData>() {
-                    if let Some(buffer) = state.lock().unwrap().buffer() {
-                        buffer.set_release_fence(fence);
-                        // Once an import fails we will wait for the entire frame, so no more
-                        // implicit imports are needed. Keep stamping explicit release points.
-                        if result.is_ok() {
-                            if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(buffer) {
-                                result = imported.import(dmabuf, fence);
-                            }
-                        }
-                    }
-                }
-            });
-            result
-        });
     }
 
     pub fn add_syncobj_state(&mut self, device_fd: smithay::backend::drm::DrmDeviceFd) {

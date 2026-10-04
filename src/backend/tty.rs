@@ -2850,15 +2850,8 @@ impl Tty {
                     }
                 }
 
-                // Both implicit and explicit clients must wait until composition has
-                // finished sampling their buffers before reusing them.
-                if !res.is_empty {
-                    if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
-                        let _span = tracy_client::span!("publish buffer read fences");
-                        niri.stamp_release_fences(output, &element.sync);
-                    }
-                }
-
+                // GLES/Vulkan publish the dependencies of each actual submission,
+                // including earlier offscreen and capture reads, before releasing buffers.
                 niri.update_primary_scanout_output(output, &res.states);
                 if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
                     niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
