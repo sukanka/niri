@@ -61,6 +61,7 @@ pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
 mod pointer_constraints;
+mod pointer_redraw;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
@@ -2505,6 +2506,8 @@ impl State {
 
         let pos = pointer.current_location();
 
+        let previous_pointer = pointer_redraw::displayed_position(&self.niri);
+
         // We have an output, so we can compute the new location and focus.
         let mut new_pos = pos + event.delta();
 
@@ -2531,6 +2534,8 @@ impl State {
             }
             pointer_confined = Some((constraint.focus, constraint.region));
         }
+
+        let redraw = pointer_redraw::MotionRedraw::new(&self.niri, previous_pointer);
 
         // Warp pointer across the screen during the spatial movement grabs.
         let spatial_grab = pointer.with_grab(|_, grab| {
@@ -2700,9 +2705,7 @@ impl State {
         #[cfg(feature = "dbus")]
         self.a11y_notify_pointer_motion();
 
-        // Redraw to update the cursor position.
-        // FIXME: redraw only outputs overlapping the cursor.
-        self.niri.queue_redraw_all();
+        redraw.queue(&mut self.niri);
     }
 
     fn on_pointer_motion_absolute<I: InputBackend>(
@@ -2747,6 +2750,11 @@ impl State {
             pointer.frame(self);
             return;
         }
+
+        let redraw = pointer_redraw::MotionRedraw::new(
+            &self.niri,
+            pointer_redraw::displayed_position(&self.niri),
+        );
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
@@ -2817,9 +2825,7 @@ impl State {
         #[cfg(feature = "dbus")]
         self.a11y_notify_pointer_motion();
 
-        // Redraw to update the cursor position.
-        // FIXME: redraw only outputs overlapping the cursor.
-        self.niri.queue_redraw_all();
+        redraw.queue(&mut self.niri);
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
