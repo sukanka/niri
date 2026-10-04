@@ -8,6 +8,9 @@ pub struct FrameClock {
     last_presentation_time: Option<Duration>,
     refresh_interval_ns: Option<NonZeroU64>,
     vrr: bool,
+    // CPU time through render preparation and submission. This is a scheduling
+    // estimate, not a GPU duration or a reason to postpone a ready frame.
+    render_budget: Duration,
 }
 
 impl FrameClock {
@@ -23,6 +26,7 @@ impl FrameClock {
             last_presentation_time: None,
             refresh_interval_ns,
             vrr,
+            render_budget: Duration::from_millis(1),
         }
     }
 
@@ -38,6 +42,7 @@ impl FrameClock {
 
         self.vrr = vrr;
         self.last_presentation_time = None;
+        self.render_budget = Duration::from_millis(1);
     }
 
     pub fn vrr(&self) -> bool {
@@ -54,8 +59,27 @@ impl FrameClock {
     }
 
     pub fn next_presentation_time(&self) -> Duration {
-        let mut now = get_monotonic_time();
+        self.next_presentation_time_at(get_monotonic_time())
+    }
 
+    /// Latest estimated start for an already queued output. Use a shared `now`
+    /// when comparing outputs so sorting cannot move a deadline across a vblank.
+    pub fn render_start_deadline(&self, now: Duration) -> Duration {
+        self.next_presentation_time_at(now)
+            .saturating_sub(self.render_budget)
+    }
+
+    pub fn record_render_duration(&mut self, elapsed: Duration) {
+        // Follow expensive frames immediately, then decay slowly so one cheap
+        // direct-scanout frame does not erase the budget for a composited frame.
+        // Bound outliers (device recovery, debugger pauses) to one refresh or 16ms.
+        let limit = self.refresh_interval().unwrap_or(Duration::from_millis(16));
+        let sample = elapsed.clamp(Duration::from_micros(100).min(limit), limit);
+        let decayed = self.render_budget.mul_f64(0.95);
+        self.render_budget = sample.max(decayed).min(limit);
+    }
+
+    fn next_presentation_time_at(&self, mut now: Duration) -> Duration {
         let Some(refresh_interval_ns) = self.refresh_interval_ns else {
             return now;
         };
@@ -94,5 +118,48 @@ impl FrameClock {
         } else {
             last_presentation_time + Duration::from_nanos(to_next_ns)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_deadlines_prioritize_earlier_refresh_and_expensive_outputs() {
+        let now = Duration::from_millis(101);
+        let mut slow = FrameClock::new(Some(Duration::from_millis(16)), false);
+        let mut fast = FrameClock::new(Some(Duration::from_millis(4)), false);
+        slow.presented(Duration::from_millis(100));
+        fast.presented(Duration::from_millis(100));
+        assert!(fast.render_start_deadline(now) < slow.render_start_deadline(now));
+        let mut expensive = FrameClock::new(Some(Duration::from_millis(16)), false);
+        expensive.presented(Duration::from_millis(100));
+        expensive.record_render_duration(Duration::from_millis(5));
+        assert!(expensive.render_start_deadline(now) < slow.render_start_deadline(now));
+        // Budgeting only orders work: presentation and frame callback timing stay unchanged.
+        assert_eq!(
+            expensive.next_presentation_time_at(now),
+            slow.next_presentation_time_at(now)
+        );
+    }
+
+    #[test]
+    fn render_budget_is_bounded_and_recovers_from_outliers() {
+        let mut clock = FrameClock::new(Some(Duration::from_millis(4)), false);
+        clock.record_render_duration(Duration::from_secs(20));
+        assert_eq!(clock.render_budget, Duration::from_millis(4));
+        for _ in 0..200 {
+            clock.record_render_duration(Duration::ZERO);
+        }
+        assert_eq!(clock.render_budget, Duration::from_micros(100));
+        clock.set_vrr(true);
+        assert_eq!(clock.render_budget, Duration::from_millis(1));
+        clock.presented(Duration::from_millis(100));
+        let now = Duration::from_millis(110);
+        assert!(clock.render_start_deadline(now) <= now);
+        assert_eq!(clock.next_presentation_time_at(now), now);
+        let unknown = FrameClock::new(None, false);
+        assert!(unknown.render_start_deadline(now) <= now);
     }
 }

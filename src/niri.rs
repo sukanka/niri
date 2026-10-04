@@ -4434,7 +4434,20 @@ impl Niri {
     }
 
     pub fn queued_outputs(&self) -> Vec<Output> {
-        self.output_state.keys().cloned().collect()
+        let now = get_monotonic_time();
+        let mut outputs: Vec<_> = self.output_state.keys().cloned().collect();
+        // An expensive low-refresh output must not arbitrarily run ahead of a
+        // higher-refresh output whose submission deadline is about to expire.
+        // Keep all outputs here: commit-timing wakeups also iterate this list.
+        outputs.sort_by_cached_key(|output| {
+            (
+                self.output_state[output]
+                    .frame_clock
+                    .render_start_deadline(now),
+                output.name(),
+            )
+        });
+        outputs
     }
 
     pub fn is_queued(&self, output: &Output) -> bool {
@@ -5463,6 +5476,7 @@ impl Niri {
 
     fn redraw(&mut self, backend: &mut Backend, output: &Output) {
         let _span = tracy_client::span!("Niri::redraw");
+        let render_started = get_monotonic_time();
 
         // Verify our invariant.
         let state = self.output_state.get_mut(output).unwrap();
@@ -5504,6 +5518,14 @@ impl Niri {
 
             // Render.
             res = backend.render(self, output, target_presentation_time);
+        }
+
+        if res == RenderResult::Submitted {
+            self.output_state
+                .get_mut(output)
+                .unwrap()
+                .frame_clock
+                .record_render_duration(get_monotonic_time().saturating_sub(render_started));
         }
 
         let is_locked = self.is_locked();
