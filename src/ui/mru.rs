@@ -1157,8 +1157,9 @@ impl WindowMruUi {
                     .render(ctx.renderer, Scale::from(scale), &elems)
                 {
                     Ok((elem, _sync, _data)) => {
-                        // FIXME: would be good to passthrough offscreen data to visible windows here.
-                        // As is, during the closing fade, windows from other workspaces stop receiving
+                        // FIXME: would be good to passthrough offscreen data to visible windows
+                        // here. As is, during the closing fade, windows
+                        // from other workspaces stop receiving
                         // frame callbacks.
                         //
                         // However, we need to refactor our offscreen data a bit to make this nicer.
@@ -1166,7 +1167,8 @@ impl WindowMruUi {
                         // offscreens showing the same window (possibly in addition to the window
                         // itself).
                         //
-                        // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
+                        // Anyhow, this is not very noticeable since Alt-Tab closing happens
+                        // quickly.
                         push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
                         pushed_offscreen = true;
                     }

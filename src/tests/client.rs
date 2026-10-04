@@ -581,6 +581,14 @@ impl Window {
         self.surface.damage_buffer(0, 0, i32::from(w), i32::from(h));
     }
 
+    pub fn attach_shm_pixels(&self, w: u16, h: u16, format: wl_shm::Format, pixels: &[u8]) {
+        let shm = self.shm.as_ref().expect("compositor has no wl_shm global");
+        let buffer =
+            create_shm_buffer_with_data(shm, &self.qh, i32::from(w), i32::from(h), format, pixels);
+        self.surface.attach(Some(&buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, i32::from(w), i32::from(h));
+    }
+
     pub fn attach_null(&self) {
         self.surface.attach(None, 0, 0);
     }
@@ -776,9 +784,6 @@ impl Dispatch<WlCallback, Arc<SyncData>> for State {
 /// The contents don't matter for correctness, but a non-uniform image makes it obvious in a
 /// screenshot when a shader samples the wrong texture or the wrong part of one.
 fn create_shm_buffer(shm: &WlShm, qh: &QueueHandle<State>, w: i32, h: i32) -> WlBuffer {
-    use std::io::Write as _;
-    use std::os::fd::{AsFd as _, FromRawFd as _};
-
     let stride = w * 4;
     let len = (stride * h) as usize;
 
@@ -792,14 +797,32 @@ fn create_shm_buffer(shm: &WlShm, qh: &QueueHandle<State>, w: i32, h: i32) -> Wl
         }
     }
 
+    create_shm_buffer_with_data(shm, qh, w, h, wl_shm::Format::Argb8888, &pixels)
+}
+
+fn create_shm_buffer_with_data(
+    shm: &WlShm,
+    qh: &QueueHandle<State>,
+    w: i32,
+    h: i32,
+    format: wl_shm::Format,
+    pixels: &[u8],
+) -> WlBuffer {
+    use std::io::Write as _;
+    use std::os::fd::{AsFd as _, FromRawFd as _};
+
+    let stride = w * 4;
+    let len = (stride * h) as usize;
+    assert_eq!(pixels.len(), len);
+
     let fd = unsafe { libc::memfd_create(c"niri-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0, "error creating a memfd for the shm buffer");
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(&pixels).unwrap();
+    file.write_all(pixels).unwrap();
     file.flush().unwrap();
 
     let pool = shm.create_pool(file.as_fd(), len as i32, qh, ());
-    let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb8888, qh, ());
+    let buffer = pool.create_buffer(0, w, h, stride, format, qh, ());
     pool.destroy();
 
     buffer

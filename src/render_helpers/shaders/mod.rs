@@ -753,7 +753,8 @@ pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
 
 #[cfg(test)]
 mod tests {
-    use smithay::backend::vulkan::{version::Version, Instance, PhysicalDevice};
+    use smithay::backend::vulkan::version::Version;
+    use smithay::backend::vulkan::{Instance, PhysicalDevice};
 
     use super::*;
 

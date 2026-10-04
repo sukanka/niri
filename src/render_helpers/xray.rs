@@ -311,15 +311,6 @@ impl RenderElement<GlesRenderer> for XrayElement {
             _ => None,
         });
 
-        let mut buffer = self.buffer.borrow_mut();
-        let texture = match buffer.render_gles(frame, self.blur) {
-            Ok(x) => x,
-            Err(err) => {
-                warn!("error rendering effect buffer: {err:?}");
-                return Ok(());
-            }
-        };
-
         // FIXME: avoid reallocating a fresh Vec here somehow.
         let mut filtered_damage = Vec::new();
         let damage = if let Some(subregion) = &self.subregion {
@@ -342,6 +333,17 @@ impl RenderElement<GlesRenderer> for XrayElement {
             &filtered_damage[..]
         } else {
             damage
+        };
+
+        // Subregion clipping can remove all damage. Avoid evaluating the shared blur until
+        // we know this element will actually sample it.
+        let mut buffer = self.buffer.borrow_mut();
+        let texture = match buffer.render_gles(frame, self.blur) {
+            Ok(x) => x,
+            Err(err) => {
+                warn!("error rendering effect buffer: {err:?}");
+                return Ok(());
+            }
         };
 
         let uniforms = program.is_some().then(|| {
@@ -376,15 +378,6 @@ impl XrayElement {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
-        let mut buffer = self.buffer.borrow_mut();
-        let texture = match buffer.render_vulkan(vk_frame, self.blur) {
-            Ok(x) => x,
-            Err(err) => {
-                warn!("error rendering effect buffer: {err:?}");
-                return Ok(());
-            }
-        };
-
         // FIXME: avoid reallocating a fresh Vec here somehow.
         let mut filtered_damage = Vec::new();
         let damage = if let Some(subregion) = &self.subregion {
@@ -407,6 +400,15 @@ impl XrayElement {
             &filtered_damage[..]
         } else {
             damage
+        };
+
+        let mut buffer = self.buffer.borrow_mut();
+        let texture = match buffer.render_vulkan(vk_frame, self.blur) {
+            Ok(x) => x,
+            Err(err) => {
+                warn!("error rendering effect buffer: {err:?}");
+                return Ok(());
+            }
         };
 
         let program = self.program.as_ref().and_then(|program| match program {

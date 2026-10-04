@@ -882,14 +882,28 @@ impl State {
         // build up (the 1 second frame callback timer will call this line).
         self.niri.advance_animations();
 
+        let mut captures = Vec::new();
         for output in self.niri.queued_outputs() {
             if self.niri.is_queued(&output) {
-                self.niri.redraw(&mut self.backend, &output);
+                let target = self.niri.redraw(&mut self.backend, &output);
+                captures.push((output, target));
+            }
+        }
 
-                let state = self.niri.output_state.get(&output).unwrap();
-                if matches!(state.redraw_state, RedrawState::Idle) {
-                    self.signal_fifo(&output);
-                }
+        // Capture can wait for GPU readback. Submit every queued display frame first so a
+        // capture on one output cannot block another output's presentation deadline.
+        for (output, target) in &captures {
+            self.niri
+                .render_captures(&mut self.backend, output, *target);
+        }
+
+        // Clearing FIFO blockers applies commits immediately. Keep the scene stable until
+        // every capture has consumed the displayed state, then unblock the next frames.
+        for (output, target) in captures {
+            let state = self.niri.output_state.get(&output).unwrap();
+            if matches!(state.redraw_state, RedrawState::Idle) {
+                self.niri.clock.set_unadjusted(target);
+                self.signal_fifo(&output);
             }
         }
 
@@ -2789,22 +2803,34 @@ impl Niri {
         window: &Mapped,
         output: &Output,
     ) -> ImageDescription {
+        let (desc, fullscreen) = self.preferred_output_description(output);
+        if fullscreen.is_none_or(|id| id == window.id().get()) {
+            desc
+        } else {
+            ImageDescription::SRGB
+        }
+    }
+
+    /// The preferred description and, in auto mode, the only window it applies to.
+    fn preferred_output_description(&self, output: &Output) -> (ImageDescription, Option<u64>) {
         let Some((hdr, caps)) = self.output_hdr_config(output) else {
-            return ImageDescription::SRGB;
+            return (ImageDescription::SRGB, None);
         };
         match hdr.mode {
-            HdrMode::On => Self::hdr_blend_description(&hdr, caps),
+            HdrMode::On => (Self::hdr_blend_description(&hdr, caps), None),
             HdrMode::Auto => {
-                let is_active_fullscreen = window.sizing_mode().is_fullscreen()
-                    && self
-                        .layout
-                        .monitor_for_output(output)
-                        .and_then(|mon| mon.active_window())
-                        .is_some_and(|active| active.id() == window.id());
-                if is_active_fullscreen {
-                    Self::hdr_blend_description(&hdr, caps)
+                let active = self
+                    .layout
+                    .monitor_for_output(output)
+                    .and_then(|mon| mon.active_window())
+                    .filter(|window| window.sizing_mode().is_fullscreen());
+                if let Some(active) = active {
+                    (
+                        Self::hdr_blend_description(&hdr, caps),
+                        Some(active.id().get()),
+                    )
                 } else {
-                    ImageDescription::SRGB
+                    (ImageDescription::SRGB, None)
                 }
             }
         }
@@ -2838,36 +2864,50 @@ impl Niri {
     pub fn refresh_color_management(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_color_management");
 
-        let outputs: Vec<Output> = self.global_space.outputs().cloned().collect();
-        for output in &outputs {
-            let desc = self.output_blend_description(output);
+        // Resolve config, HDR capabilities and active fullscreen state once per output,
+        // instead of repeating these lookups for every window in every dispatch cycle.
+        let outputs: Vec<_> = self
+            .global_space
+            .outputs()
+            .map(|output| {
+                let blend = self.output_blend_description(output);
+                let (preferred, fullscreen) = self.preferred_output_description(output);
+                (output.clone(), blend, preferred, fullscreen)
+            })
+            .collect();
+        for (output, desc, _, _) in &outputs {
             let Some(state) = self.output_state.get_mut(output) else {
                 continue;
             };
-            if state.blend_description != Some(desc) {
-                state.blend_description = Some(desc);
+            if state.blend_description != Some(*desc) {
+                state.blend_description = Some(*desc);
                 self.color_management_state
                     .output_description_changed(output);
             }
         }
 
-        let mut updates: Vec<(WlSurface, ImageDescription)> = Vec::new();
         for (monitor, window) in self.layout.windows() {
             let Some(output) = monitor.map(|mon| mon.output()) else {
                 continue;
             };
-            let desc = self.preferred_description_for_window(window, output);
-            updates.push((window.toplevel().wl_surface().clone(), desc));
-        }
-        for output in &outputs {
-            let blend = self.output_blend_description(output);
-            for layer in layer_map_for_output(output).layers() {
-                updates.push((layer.wl_surface().clone(), blend));
-            }
-        }
-        for (surface, desc) in updates {
+            let Some((_, _, preferred, fullscreen)) =
+                outputs.iter().find(|(out, ..)| out == output)
+            else {
+                continue;
+            };
+            let desc = if fullscreen.is_none_or(|id| id == window.id().get()) {
+                *preferred
+            } else {
+                ImageDescription::SRGB
+            };
             self.color_management_state
-                .preferred_changed(&surface, desc);
+                .preferred_changed(window.toplevel().wl_surface(), desc);
+        }
+        for (output, blend, ..) in &outputs {
+            for layer in layer_map_for_output(output).layers() {
+                self.color_management_state
+                    .preferred_changed(layer.wl_surface(), *blend);
+            }
         }
     }
 
@@ -5486,7 +5526,7 @@ impl Niri {
         }
     }
 
-    fn redraw(&mut self, backend: &mut Backend, output: &Output) {
+    fn redraw(&mut self, backend: &mut Backend, output: &Output) -> Duration {
         let _span = tracy_client::span!("Niri::redraw");
         let render_started = get_monotonic_time();
 
@@ -5607,6 +5647,35 @@ impl Niri {
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
         self.send_frame_callbacks(output);
+        target_presentation_time
+    }
+
+    fn render_captures(
+        &mut self,
+        backend: &mut Backend,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) {
+        let _span = tracy_client::span!("Niri::render_captures");
+        #[allow(unused_mut)]
+        let mut has_captures = !self.image_copy_sessions.is_empty()
+            || !self.image_copy_cursor_sessions.is_empty()
+            || self
+                .screencopy_state
+                .queues()
+                .any(|queue| !queue.is_empty());
+        #[cfg(feature = "xdp-gnome-screencast")]
+        {
+            has_captures |= self.casting.casts.iter().any(|cast| cast.is_active());
+        }
+        if !has_captures {
+            return;
+        }
+
+        self.clock.set_unadjusted(target_presentation_time);
+        // Preparing other outputs changed shared layout state (including insert hints).
+        // Rebuild at this output's presentation time before a capture traverses the scene.
+        self.update_render_elements(Some(output));
         crate::with_output_renderer_any!(backend, Some(output), |renderer| {
             #[cfg(feature = "xdp-gnome-screencast")]
             {

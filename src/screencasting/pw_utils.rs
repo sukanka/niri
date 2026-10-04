@@ -39,7 +39,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
+use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::output::{Output, OutputModeSource};
 use smithay::reexports::calloop::generic::Generic;
@@ -54,17 +54,15 @@ use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
-use crate::render_helpers::blend::set_sdr_capture_blend;
 use crate::render_helpers::renderer::NiriCaptureRenderer;
-use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
-    render_to_dmabuf,
-};
+use crate::render_helpers::{clear_dmabuf, encompassing_geo, render_and_download};
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 
 mod shm_mapping;
 use shm_mapping::ShmMapping;
+mod render;
+use render::RenderCache;
 
 // Give a 0.1 ms allowance for presentation time errors.
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
@@ -225,6 +223,7 @@ struct CastInner {
     min_time_between_frames: Duration,
     dmabufs: HashMap<i64, Dmabuf>,
     shmbufs: HashMap<i64, Shmbuf>,
+    render_cache: RenderCache,
     /// Buffers dequeued from PipeWire in process of rendering.
     ///
     /// This is an ordered list of buffers that we started rendering to and waiting for the
@@ -599,6 +598,7 @@ impl PipeWire {
             min_time_between_frames: Duration::ZERO,
             dmabufs: HashMap::new(),
             shmbufs: HashMap::new(),
+            render_cache: RenderCache::default(),
             rendering_buffers: Vec::new(),
         }));
 
@@ -1199,7 +1199,7 @@ impl Cast {
         } else {
             // The consumer may keep the same SHM format after receiving the new DMA offer.
             // Keep it usable even if PipeWire does not emit another format-changed event.
-            inner.state.reset_damage();
+            inner.reset_damage();
         }
         let refresh = inner.refresh;
         drop(inner);
@@ -1497,7 +1497,6 @@ impl Cast {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn dequeue_buffer_and_render<R: NiriCaptureRenderer>(
         &mut self,
         renderer: &mut R,
@@ -1512,6 +1511,11 @@ impl Cast {
         CastRenderElement<R>: RenderElement<R>,
     {
         let mut inner = self.inner.borrow_mut();
+
+        let parameters_changed =
+            inner
+                .render_cache
+                .prepare(renderer, size, scale, reference_luminance);
 
         let CastState::Ready {
             damage_tracker,
@@ -1553,7 +1557,7 @@ impl Cast {
         if self.cursor_mode == CursorMode::Metadata || self.cursor_mode == CursorMode::Hidden {
             elements = &elements[cursor_data.elem_count..];
         }
-        let (damage, states) = damage_tracker.damage_output(1, elements).unwrap();
+        let (damage, _states) = damage_tracker.damage_output(1, elements).unwrap();
 
         if self.cursor_mode == CursorMode::Metadata {
             let (damage, _states) = cursor_damage_tracker
@@ -1564,7 +1568,11 @@ impl Cast {
 
         let cursor_location =
             (self.cursor_mode == CursorMode::Metadata).then_some(cursor_data.location);
-        if !pending_frame.update(damage.is_some(), cursor_damaged, cursor_location) {
+        if !pending_frame.update(
+            damage.is_some() || parameters_changed,
+            cursor_damaged,
+            cursor_location,
+        ) {
             trace!("no damage, skipping frame");
             return false;
         }
@@ -1579,15 +1587,9 @@ impl Cast {
 
         let mut inner = self.inner.borrow_mut();
         let inner_ = &mut *inner;
-        let CastState::Ready {
-            damage_tracker,
-            alpha,
-            ..
-        } = &mut inner_.state
-        else {
+        let CastState::Ready { alpha, .. } = &mut inner_.state else {
             unreachable!()
         };
-        let damage_tracker = damage_tracker.as_mut().unwrap();
         let alpha = *alpha;
 
         unsafe {
@@ -1597,23 +1599,17 @@ impl Cast {
                 add_cursor_metadata(renderer, spa_buffer, cursor_data, redraw_cursor);
             }
 
-            // FIXME: would be good to skip rendering the full frame if only the pointer changed.
-            // Unfortunately, I think the OBS PipeWire code needs to be updated first to cleanly
-            // allow for that codepath.
+            // Every submitted buffer still contains a complete image, including for consumers
+            // that cannot handle metadata-only frames. Reused buffers only redraw their damage.
             let fd = (*(*spa_buffer).datas).fd;
 
             let res = match (*(*spa_buffer).datas).type_ {
                 x if x == DataType::DmaBuf.as_raw() => {
                     let dmabuf = inner_.dmabufs[&fd].clone();
-                    render_to_dmabuf(
-                        renderer,
-                        damage_tracker,
-                        dmabuf,
-                        elements,
-                        states,
-                        reference_luminance,
-                    )
-                    .map(|x| (x, SharingBuf::Dma))
+                    inner_
+                        .render_cache
+                        .render_dmabuf(renderer, fd, dmabuf, elements)
+                        .map(|x| (x, SharingBuf::Dma))
                 }
                 x if x == DataType::MemFd.as_raw() => {
                     let shmbuf = &inner_.shmbufs[&fd];
@@ -1624,16 +1620,10 @@ impl Cast {
                         Fourcc::Xrgb8888
                     };
 
-                    render_to_shmbuf(
-                        renderer,
-                        damage_tracker,
-                        shmbuf,
-                        fourcc,
-                        elements,
-                        states,
-                        reference_luminance,
-                    )
-                    .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
+                    inner_
+                        .render_cache
+                        .render_shm(renderer, fd, shmbuf, fourcc, elements)
+                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
                 }
                 _ => Err(anyhow::anyhow!(
                     "unknown data type in dequeue_buffer_and_render"
@@ -1681,7 +1671,7 @@ impl Cast {
             return false;
         }
 
-        inner.state.reset_damage();
+        inner.reset_damage();
         drop(inner);
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
@@ -1738,6 +1728,11 @@ impl Cast {
 }
 
 impl CastInner {
+    fn reset_damage(&mut self) {
+        self.state.reset_damage();
+        self.render_cache = RenderCache::default();
+    }
+
     unsafe fn on_add_buffer(
         &mut self,
         gbm: Option<&GbmDevice<DeviceFd>>,
@@ -1812,7 +1807,11 @@ impl CastInner {
                     assert!(self.dmabufs.insert(fd, dmabuf).is_none());
                 }
 
-                Ok(self.dmabufs.len() == 1)
+                let first = self.dmabufs.len() == 1;
+                if first {
+                    self.reset_damage();
+                }
+                Ok(first)
             }
             None => {
                 trace!("pw stream: add_buffer (shm), size={size:?}, alpha={alpha}");
@@ -1839,7 +1838,11 @@ impl CastInner {
                     assert!(self.shmbufs.insert(fd, shmbuf).is_none());
                 }
 
-                Ok(self.shmbufs.len() == 1)
+                let first = self.shmbufs.len() == 1;
+                if first {
+                    self.reset_damage();
+                }
+                Ok(first)
             }
         }
     }
@@ -1857,12 +1860,14 @@ impl CastInner {
                 assert!((*spa_buffer).n_datas > 0);
 
                 let fd = (*spa_data).fd;
+                self.render_cache.remove_buffer(fd);
                 self.dmabufs.remove(&fd);
             } else if (*spa_data).type_ == DataType::MemFd.as_raw() {
                 trace!("pw stream: remove_buffer (shm)");
                 assert_eq!((*spa_buffer).n_datas, SHM_BLOCKS as u32);
 
                 let fd = (*spa_data).fd;
+                self.render_cache.remove_buffer(fd);
                 self.shmbufs.remove(&fd);
             } else {
                 error!(
@@ -2297,38 +2302,6 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
     }
-}
-
-fn render_to_shmbuf<R: NiriCaptureRenderer>(
-    renderer: &mut R,
-    damage_tracker: &mut OutputDamageTracker,
-    buffer: &Shmbuf,
-    fourcc: Fourcc,
-    elements: &[impl RenderElement<R>],
-    states: RenderElementStates,
-    reference_luminance: f64,
-) -> anyhow::Result<()>
-where
-    R::Error: Send + Sync + 'static,
-{
-    let _span = tracy_client::span!();
-    set_sdr_capture_blend(renderer, reference_luminance);
-    let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
-    let expected_size = size.w as usize * size.h as usize * SHM_BYTES_PER_PIXEL;
-    ensure!(
-        buffer.layout.size_usize() == expected_size,
-        "invalid buffer size"
-    );
-
-    let mapping =
-        render_and_download_with_damage(renderer, damage_tracker, fourcc, elements, states)?;
-
-    let bytes = renderer
-        .map_texture(&mapping)
-        .context("error mapping texture")?;
-
-    buffer.mapping.copy_frame(bytes);
-    Ok(())
 }
 
 fn clear_shmbuf(buffer: &Shmbuf) {

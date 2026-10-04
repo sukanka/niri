@@ -49,6 +49,8 @@ pub struct IpcServer {
     pub socket_path: Option<PathBuf>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    /// Scratch membership set shared by the sequential workspace and window refreshes.
+    refresh_seen: RefCell<HashSet<u64>>,
 }
 
 struct ClientCtx {
@@ -110,6 +112,7 @@ impl IpcServer {
             socket_path,
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
+            refresh_seen: RefCell::new(HashSet::new()),
         })
     }
 
@@ -620,7 +623,8 @@ impl State {
         let focused_ws_id = layout.active_workspace().map(|ws| ws.id().get());
 
         // Check for workspace changes.
-        let mut seen = HashSet::new();
+        let mut seen = server.refresh_seen.borrow_mut();
+        seen.clear();
         let mut need_workspaces_changed = false;
         for (mon, ws_idx, ws) in layout.workspaces() {
             let id = ws.id().get();
@@ -720,7 +724,8 @@ impl State {
         let mut batch_change_layouts: Vec<(u64, WindowLayout)> = Vec::new();
 
         // Check for window changes.
-        let mut seen = HashSet::new();
+        let mut seen = server.refresh_seen.borrow_mut();
+        seen.clear();
         let mut focused_id = None;
         layout.with_windows(|mapped, _, ws_id, window_layout| {
             let id = mapped.id().get();
