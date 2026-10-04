@@ -14,6 +14,7 @@ mod locking;
 mod multigpu_sync;
 mod remove_output;
 mod render_status;
+mod scanout_color;
 mod shader_runtime;
 mod suspended;
 mod transactions;

@@ -36,13 +36,16 @@ use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::{
-    RenderElementPresentationState, RenderElementStates, RenderingReason,
+    Id, RenderElement, RenderElementPresentationState, RenderElementStates, RenderingReason,
+    UnderlyingStorage,
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::vulkan::VulkanBackend;
 use smithay::backend::renderer::multigpu::GpuManager;
-use smithay::backend::renderer::{Bind, DebugFlags, ImportDma, ImportEgl, PresentationMode};
+use smithay::backend::renderer::{
+    Bind, DebugFlags, ImportDma, ImportEgl, PresentationMode, Renderer,
+};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -2623,9 +2626,72 @@ impl Tty {
         };
         let peak_luminance =
             blend::output_peak_luminance(blend_hdr, scanout_ref_lum, edid_hdr.max_luminance);
+
+        // A blend-space change alters what every shader outputs without any element damage;
+        // force a full redraw. The cursor plane's contents bypass the renderer entirely, so
+        // they get the equivalent sRGB-to-PQ encode on the CPU instead.
+        let blend = blend_hdr.then_some((reference_luminance, peak_luminance));
+        if surface.last_blend != Some(blend) {
+            surface.last_blend = Some(blend);
+            surface.compositor.reset_buffers();
+            surface
+                .compositor
+                .set_cursor_buffer_transform(blend.map(|(ref_lum, _)| {
+                    let encoder = blend::SrgbToPqEncoder::new((ref_lum / 10000.) as f32);
+                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    }) as Box<_>
+                }));
+            // Frames offloading the PQ encode to the gamma LUT (see use_post_blend_encode below)
+            // need the cursor in the same normalized linear light as the scanned out surface.
+            surface
+                .compositor
+                .set_cursor_buffer_transform_post_blend(blend.map(|(ref_lum, peak_lum)| {
+                    let encoder = blend::SrgbToPqEncoder::new_linear((ref_lum / peak_lum) as f32);
+                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    }) as Box<_>
+                }));
+        }
+
+        let mut renderer = match self.gpu_manager.renderer(
+            &render_node,
+            &device.render_node.unwrap_or(self.primary_render_node),
+            surface.compositor.format(),
+        ) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                warn!(%render_node, "error creating renderer for output GPU: {err:?}");
+                return rv;
+            }
+        };
+
+        // Render the elements.
+        let ctx = RenderCtx {
+            renderer: &mut renderer,
+            target: RenderTarget::Output,
+            xray: None,
+        };
+        let mut elements = niri.render_to_vec(ctx, output, true);
+
+        // Visualize the damage, if enabled.
+        if niri.debug_draw_damage {
+            let output_state = niri.output_state.get_mut(output).unwrap();
+            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+        }
+
+        // Only build color transforms for window surfaces that can reach a plane this frame.
+        // Changes to off-screen windows must not invalidate Smithay's failed-plane cache.
         #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
-        let transforms =
-            niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum, peak_luminance);
+        let candidates = wayland_scanout_candidates(&mut renderer, &elements);
+        #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+        let transforms = niri.scanout_color_transforms(
+            output,
+            &candidates,
+            blend_hdr,
+            scanout_ref_lum,
+            peak_luminance,
+        );
 
         // Planes whose color pipelines can't apply the PQ encode (nvidia's always end in linear
         // light) can still scan out a single fullscreen surface by moving the encode behind
@@ -2663,59 +2729,6 @@ impl Tty {
                 connector = surface.name.connector,
                 "post-blend encode offload unsupported (no GAMMA_LUT or primary plane color pipelines)"
             );
-        }
-
-        // A blend-space change alters what every shader outputs without any element damage;
-        // force a full redraw. The cursor plane's contents bypass the renderer entirely, so
-        // they get the equivalent sRGB-to-PQ encode on the CPU instead.
-        let blend = blend_hdr.then_some((reference_luminance, peak_luminance));
-        if surface.last_blend != Some(blend) {
-            surface.last_blend = Some(blend);
-            surface.compositor.reset_buffers();
-            surface
-                .compositor
-                .set_cursor_buffer_transform(blend.map(|(ref_lum, _)| {
-                    let encoder = blend::SrgbToPqEncoder::new((ref_lum / 10000.) as f32);
-                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
-                        encoder.apply(data, stride, size);
-                    }) as Box<_>
-                }));
-            // Frames offloading the PQ encode to the gamma LUT (see use_post_blend_encode above)
-            // need the cursor in the same normalized linear light as the scanned out surface.
-            surface
-                .compositor
-                .set_cursor_buffer_transform_post_blend(blend.map(|(ref_lum, peak_lum)| {
-                    let encoder = blend::SrgbToPqEncoder::new_linear((ref_lum / peak_lum) as f32);
-                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
-                        encoder.apply(data, stride, size);
-                    }) as Box<_>
-                }));
-        }
-
-        let mut renderer = match self.gpu_manager.renderer(
-            &render_node,
-            &device.render_node.unwrap_or(self.primary_render_node),
-            surface.compositor.format(),
-        ) {
-            Ok(renderer) => renderer,
-            Err(err) => {
-                warn!(%render_node, "error creating renderer for output GPU: {err:?}");
-                return rv;
-            }
-        };
-
-        // Render the elements.
-        let ctx = RenderCtx {
-            renderer: &mut renderer,
-            target: RenderTarget::Output,
-            xray: None,
-        };
-        let mut elements = niri.render_to_vec(ctx, output, true);
-
-        // Visualize the damage, if enabled.
-        if niri.debug_draw_damage {
-            let output_state = niri.output_state.get_mut(output).unwrap();
-            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
         }
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
@@ -2767,7 +2780,7 @@ impl Tty {
                     // cursor falls back to primary-plane composition.
                     flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 }
-                // Primary- and overlay-plane scanout stay allowed: every window surface has a
+                // Primary- and overlay-plane scanout stay allowed: every candidate window has a
                 // scanout color transform (see use_color_transforms above), so mismatched
                 // content is converted by the plane's color pipeline, composited when the
                 // hardware can't express the conversion, and unlisted elements are denied
@@ -3813,6 +3826,25 @@ fn composition_render_node<Node>(
     } else {
         primary_render_node
     }
+}
+
+/// Surface IDs eligible for plane assignment, before DRM performs its final visibility checks.
+/// Shader-clipped surfaces and offscreens cannot scan out, even when they reuse a surface ID.
+#[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+pub(crate) fn wayland_scanout_candidates<R: Renderer, E: RenderElement<R>>(
+    renderer: &mut R,
+    elements: &[E],
+) -> HashSet<Id> {
+    elements
+        .iter()
+        .filter_map(|element| {
+            matches!(
+                element.underlying_storage(renderer),
+                Some(UnderlyingStorage::Wayland(_))
+            )
+            .then(|| element.id().clone())
+        })
+        .collect()
 }
 
 fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {

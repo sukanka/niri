@@ -15,17 +15,26 @@ use std::time::Duration;
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation};
 use niri_ipc::SizeChange;
+use smithay::backend::renderer::element::surface::{
+    render_elements_from_surface_tree, WaylandSurfaceRenderElement,
+};
+use smithay::backend::renderer::element::utils::{
+    CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
+};
 use smithay::backend::renderer::element::{Element as _, Kind};
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::{gpu, Fixture};
+use crate::backend::tty::wayland_scanout_candidates;
 use crate::backend::tty_renderer::TtyOffscreen;
 use crate::layout::tile::TileRenderElement;
 use crate::render_helpers::background_effect::{BackgroundEffectElement, RenderParams};
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
+use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::offscreen::OffscreenBuffer;
 use crate::render_helpers::renderer::NiriCaptureRenderer;
@@ -607,6 +616,116 @@ fn scene_fullscreen_transition_keeps_background_effects_gles() {
         set_time(&mut f, Duration::from_millis(500));
         assert_tile_background_effects(&mut f, xray, true);
     }
+}
+
+/// Geometry wrappers retain the client's Wayland storage and must not lose its color
+/// transform just because the window is cropped, moved or scaled by the layout.
+#[test]
+fn wayland_scanout_candidates_preserve_surface_wrappers_gles() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    add_window(&mut f);
+    let surface = f
+        .niri()
+        .layout
+        .focus()
+        .unwrap()
+        .toplevel()
+        .wl_surface()
+        .clone();
+    let renderer = f.niri_state().backend.headless().renderer().unwrap();
+    let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        render_elements_from_surface_tree(
+            renderer,
+            &surface,
+            (0, 0),
+            1.,
+            1.,
+            Kind::ScanoutCandidate,
+        );
+    assert_eq!(elements.len(), 1);
+    let element = elements.pop().unwrap();
+    let expected = std::collections::HashSet::from([element.id().clone()]);
+    assert_eq!(
+        wayland_scanout_candidates(renderer, std::slice::from_ref(&element)),
+        expected
+    );
+
+    let element = blend::BlendSurfaceRenderElement::new(element, blend::ContentColor::default());
+    assert_eq!(
+        wayland_scanout_candidates(renderer, std::slice::from_ref(&element)),
+        expected
+    );
+
+    let element = RescaleRenderElement::from_element(element, Point::from((0, 0)), 1.25);
+    assert_eq!(
+        wayland_scanout_candidates(renderer, std::slice::from_ref(&element)),
+        expected
+    );
+    let crop = Rectangle::new((2, 3).into(), (40, 50).into());
+    let element = CropRenderElement::from_element(element, 1., crop).unwrap();
+    assert_eq!(
+        wayland_scanout_candidates(renderer, std::slice::from_ref(&element)),
+        expected
+    );
+    let element = RelocateRenderElement::from_element(element, (10, 20), Relocate::Relative);
+    assert_eq!(
+        wayland_scanout_candidates(renderer, std::slice::from_ref(&element)),
+        expected
+    );
+}
+
+/// Shader clipping retains a surface ID but requires composition. Neither the clipped
+/// element nor a texture baked from it should receive a Wayland scanout color transform.
+#[test]
+fn wayland_scanout_candidates_exclude_clipped_and_offscreen_gles() {
+    let Some(mut f) = set_up(Config::default()) else {
+        return;
+    };
+    add_window(&mut f);
+    let surface = f
+        .niri()
+        .layout
+        .focus()
+        .unwrap()
+        .toplevel()
+        .wl_surface()
+        .clone();
+    let renderer = f.niri_state().backend.headless().renderer().unwrap();
+    let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        render_elements_from_surface_tree(
+            renderer,
+            &surface,
+            (0, 0),
+            1.,
+            1.,
+            Kind::ScanoutCandidate,
+        );
+    assert_eq!(elements.len(), 1);
+    let element = elements.pop().unwrap();
+    let id = element.id().clone();
+    assert!(wayland_scanout_candidates(renderer, std::slice::from_ref(&element)).contains(&id));
+
+    let scale = Scale::from(1.);
+    let geometry = element.geometry(scale).to_logical(1).to_f64();
+    let shader = ClippedSurfaceRenderElement::shader(renderer)
+        .unwrap()
+        .clone();
+    let clipped = ClippedSurfaceRenderElement::new(
+        element,
+        scale,
+        geometry,
+        shader,
+        CornerRadius::from(12.),
+        blend::ContentColor::default(),
+    );
+    assert_eq!(clipped.id(), &id);
+    assert!(wayland_scanout_candidates(renderer, std::slice::from_ref(&clipped)).is_empty());
+
+    let buffer = OffscreenBuffer::default();
+    let (offscreen, _sync, _data) = buffer.render(renderer, scale, &[clipped]).unwrap();
+    assert!(wayland_scanout_candidates(renderer, &[offscreen]).is_empty());
 }
 
 // =============================================================================

@@ -2630,8 +2630,8 @@ impl Niri {
         }
     }
 
-    /// The per-element color transforms for direct scanout on this output, mapping every
-    /// window surface to the plane color pipeline configuration that reproduces what the
+    /// The per-element color transforms for direct scanout on this output, mapping candidate
+    /// window surfaces to the plane color pipeline configuration that reproduces what the
     /// blend shaders would do to it during composition, or `None` when no pipeline can (the
     /// shaders tone map the content, which the parametric pipeline cannot express — the
     /// element must stay composited).
@@ -2645,17 +2645,28 @@ impl Niri {
     pub fn scanout_color_transforms(
         &self,
         output: &Output,
+        candidates: &HashSet<Id>,
         blend_hdr: bool,
         reference_luminance: f64,
         peak_luminance: f64,
     ) -> HashMap<Id, Option<ScanoutColorTransform>> {
         let mut transforms = HashMap::new();
+        if candidates.is_empty() {
+            return transforms;
+        }
         for mapped in self.layout.windows_for_output(output) {
             with_surface_tree_downward(
                 mapped.toplevel().wl_surface(),
                 (),
                 |_, _, _| TraversalAction::DoChildren(()),
                 |surface, states, _| {
+                    let id = Id::from_wayland_resource(surface);
+                    if !candidates.contains(&id) {
+                        // Only skip this surface, not its children: a Vulkan subsurface can be
+                        // the scanout candidate even when its parent is not rendered.
+                        return;
+                    }
+
                     // The traversal already locks the surface states; read the cached state
                     // through them rather than via get_surface_description() (which would
                     // re-lock and deadlock).
@@ -2666,7 +2677,7 @@ impl Niri {
                         .description;
                     let content = ContentColor::from_description(desc);
                     transforms.insert(
-                        Id::from_wayland_resource(surface),
+                        id,
                         scanout_color_transform(
                             content,
                             blend_hdr,
