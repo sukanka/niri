@@ -386,11 +386,12 @@ debug {
 
 <sup>Since: 25.08</sup>
 
-Skips redrawing the screen from cursor input while variable refresh rate is active.
+Briefly suppresses cursor-only updates while variable refresh rate is active and new content frames are being presented.
 
 Useful for games where the cursor isn't drawn internally to prevent erratic VRR shifts in response to cursor movement.
 
-Note that the current implementation has some issues, for example when there's nothing redrawing the screen (like a game), the rendering will appear to completely freeze (since cursor movements won't cause redraws).
+If no new frame has been presented for 50 ms, niri allows cursor-only updates again.
+A one-shot timer retries the last suppressed update even if the pointer stops moving, so an idle application does not leave the cursor frozen.
 
 ```kdl
 debug {
