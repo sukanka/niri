@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -120,6 +120,7 @@ pub struct Cast {
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
+    waiting_for_buffer: Rc<Cell<bool>>,
 }
 
 /// Mutable `Cast` state shared with PipeWire callbacks.
@@ -167,8 +168,38 @@ enum CastState {
         // Lazily-initialized to keep the initialization to a single place.
         damage_tracker: Option<OutputDamageTracker>,
         cursor_damage_tracker: Option<OutputDamageTracker>,
-        last_cursor_location: Option<Point<i32, Physical>>,
+        pending_frame: PendingFrame,
     },
+}
+
+/// Changes observed by the damage trackers but not yet sent to the consumer.
+///
+/// Damage tracking advances even when all PipeWire buffers are in use. Keep changes until a
+/// successful render so a final content or cursor update survives backpressure and render errors.
+#[derive(Debug, Default)]
+struct PendingFrame {
+    damaged: bool,
+    cursor_damaged: bool,
+    last_cursor_location: Option<Point<i32, Physical>>,
+}
+
+impl PendingFrame {
+    fn update(
+        &mut self,
+        damaged: bool,
+        cursor_damaged: bool,
+        cursor_location: Option<Point<i32, Physical>>,
+    ) -> bool {
+        self.damaged |= damaged;
+        self.cursor_damaged |= cursor_damaged;
+        self.damaged || self.cursor_damaged || self.last_cursor_location != cursor_location
+    }
+
+    fn submitted(&mut self, cursor_location: Option<Point<i32, Physical>>) {
+        self.damaged = false;
+        self.cursor_damaged = false;
+        self.last_cursor_location = cursor_location;
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -436,6 +467,8 @@ impl PipeWire {
             }
         };
         let redraw_ = redraw.clone();
+        let redraw_process = redraw.clone();
+        let waiting_for_buffer = Rc::new(Cell::new(false));
 
         let stream = StreamRc::new(
             self.core.clone(),
@@ -473,171 +506,290 @@ impl PipeWire {
             rendering_buffers: Vec::new(),
         }));
 
-        let listener =
-            stream
-                .add_local_listener_with_user_data(())
-                .state_changed({
-                    let inner = inner.clone();
-                    let stop_cast = stop_cast.clone();
-                    move |stream, (), old, new| {
-                        let _span = debug_span!("state_changed", %stream_id).entered();
-                        debug!("{old:?} -> {new:?}");
-                        let mut inner = inner.borrow_mut();
+        let listener = stream
+            .add_local_listener_with_user_data(())
+            .state_changed({
+                let inner = inner.clone();
+                let stop_cast = stop_cast.clone();
+                move |stream, (), old, new| {
+                    let _span = debug_span!("state_changed", %stream_id).entered();
+                    debug!("{old:?} -> {new:?}");
+                    let mut inner = inner.borrow_mut();
 
-                        match new {
-                            StreamState::Paused => {
-                                if inner.node_id.is_none() {
-                                    let id = stream.node_id();
-                                    inner.node_id = Some(id);
-                                    debug!("sending signal with {id}");
+                    match new {
+                        StreamState::Paused => {
+                            if inner.node_id.is_none() {
+                                let id = stream.node_id();
+                                inner.node_id = Some(id);
+                                debug!("sending signal with {id}");
 
-                                    let _span = tracy_client::span!("sending PipeWireStreamAdded");
-                                    async_io::block_on(async {
-                                        let res =
-                                            mutter_screen_cast::Stream::pipe_wire_stream_added(
-                                                &signal_ctx,
-                                                id,
-                                            )
-                                            .await;
+                                let _span = tracy_client::span!("sending PipeWireStreamAdded");
+                                async_io::block_on(async {
+                                    let res = mutter_screen_cast::Stream::pipe_wire_stream_added(
+                                        &signal_ctx,
+                                        id,
+                                    )
+                                    .await;
 
-                                        if let Err(err) = res {
-                                            warn!("error sending PipeWireStreamAdded: {err:?}");
-                                            stop_cast();
-                                        }
-                                    });
-                                }
+                                    if let Err(err) = res {
+                                        warn!("error sending PipeWireStreamAdded: {err:?}");
+                                        stop_cast();
+                                    }
+                                });
+                            }
 
+                            inner.is_active = false;
+                        }
+                        StreamState::Error(_) => {
+                            if inner.is_active {
                                 inner.is_active = false;
+                                stop_cast();
                             }
-                            StreamState::Error(_) => {
-                                if inner.is_active {
-                                    inner.is_active = false;
-                                    stop_cast();
-                                }
-                            }
-                            StreamState::Unconnected => (),
-                            StreamState::Connecting => (),
-                            StreamState::Streaming => {
-                                inner.is_active = true;
-                                redraw();
-                            }
+                        }
+                        StreamState::Unconnected => (),
+                        StreamState::Connecting => (),
+                        StreamState::Streaming => {
+                            inner.is_active = true;
+                            redraw();
                         }
                     }
-                })
-                .param_changed({
-                    let inner = inner.clone();
-                    let stop_cast = stop_cast.clone();
-                    let gbm = gbm.clone();
-                    let formats = formats.clone();
-                    move |stream, (), id, pod| {
-                        let id = ParamType::from_raw(id);
-                        trace!(%stream_id, ?id, "param_changed");
-                        let mut inner = inner.borrow_mut();
-                        let inner = &mut *inner;
+                }
+            })
+            .process({
+                let waiting_for_buffer = waiting_for_buffer.clone();
+                move |_stream, ()| {
+                    // Retry the final update once the consumer returns a buffer. Do not
+                    // continuously redraw idle streams on every PipeWire process event.
+                    if waiting_for_buffer.replace(false) {
+                        redraw_process();
+                    }
+                }
+            })
+            .param_changed({
+                let inner = inner.clone();
+                let stop_cast = stop_cast.clone();
+                let gbm = gbm.clone();
+                let formats = formats.clone();
+                move |stream, (), id, pod| {
+                    let id = ParamType::from_raw(id);
+                    trace!(%stream_id, ?id, "param_changed");
+                    let mut inner = inner.borrow_mut();
+                    let inner = &mut *inner;
 
-                        if id != ParamType::Format {
+                    if id != ParamType::Format {
+                        return;
+                    }
+
+                    let _span = debug_span!("param_changed", %stream_id).entered();
+
+                    let Some(pod) = pod else { return };
+
+                    let (m_type, m_subtype) = match parse_format(pod) {
+                        Ok(x) => x,
+                        Err(err) => {
+                            warn!("error parsing format: {err:?}");
+                            return;
+                        }
+                    };
+
+                    if m_type != MediaType::Video || m_subtype != MediaSubtype::Raw {
+                        return;
+                    }
+
+                    let mut format = VideoInfoRaw::new();
+                    format.parse(pod).unwrap();
+                    debug!("got format = {format:?}");
+
+                    let format_size = Size::from((format.size().width, format.size().height));
+
+                    let state = &mut inner.state;
+                    if format_size != state.expected_format_size() {
+                        if !matches!(&*state, CastState::ResizePending { .. }) {
+                            warn!("wrong size, but we're not resizing");
+                            stop_cast();
                             return;
                         }
 
-                        let _span = debug_span!("param_changed", %stream_id).entered();
+                        debug!("wrong size, waiting");
+                        return;
+                    }
 
-                        let Some(pod) = pod else { return };
+                    let format_has_alpha = format.format() == VideoFormat::BGRA;
+                    let fourcc = if format_has_alpha {
+                        Fourcc::Argb8888
+                    } else {
+                        Fourcc::Xrgb8888
+                    };
 
-                        let (m_type, m_subtype) = match parse_format(pod) {
-                            Ok(x) => x,
-                            Err(err) => {
-                                warn!("error parsing format: {err:?}");
-                                return;
-                            }
-                        };
+                    let max_frame_rate = format.max_framerate();
+                    let min_frame_time = Duration::from_micros(
+                        1_000_000 * u64::from(max_frame_rate.denom) / u64::from(max_frame_rate.num),
+                    );
+                    inner.min_time_between_frames = min_frame_time;
 
-                        if m_type != MediaType::Video || m_subtype != MediaSubtype::Raw {
-                            return;
-                        }
+                    // We have following cases when param_changed:
+                    //
+                    // 1. Modifier exists and its flags contain DONT_FIXATE
+                    //
+                    //    Do test allocation, set CastState to ConfirmationPending and send
+                    //    param again.
+                    //
+                    // 2. Modifier exists and it doesn't need fixation
+                    //
+                    //    Do test allocation to ensure the modifier work, then set CastState to
+                    //    Ready. Then set buffer to DMA.
+                    //
+                    // 3. Modifier doesn't exist
+                    //
+                    //    Set CastState to Ready and set buffer to SHM.
 
-                        let mut format = VideoInfoRaw::new();
-                        format.parse(pod).unwrap();
-                        debug!("got format = {format:?}");
+                    let object = pod.as_object().unwrap();
+                    let prop_modifier =
+                        object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
 
-                        let format_size = Size::from((format.size().width, format.size().height));
+                    match prop_modifier {
+                        Some(prop_modifier)
+                            if prop_modifier.flags().contains(PodPropFlags::DONT_FIXATE) =>
+                        {
+                            debug!(flags = ?prop_modifier.flags(), "fixating the modifier");
 
-                        let state = &mut inner.state;
-                        if format_size != state.expected_format_size() {
-                            if !matches!(&*state, CastState::ResizePending { .. }) {
-                                warn!("wrong size, but we're not resizing");
+                            let Some(gbm) = &gbm else {
+                                error!("negotiated dmabuf without gbm");
                                 stop_cast();
                                 return;
+                            };
+
+                            let pod_modifier = prop_modifier.value();
+                            let modifiers = match parse_modifier_candidates(pod_modifier) {
+                                Ok(modifiers) => modifiers,
+                                Err(err) => {
+                                    warn!("invalid modifier property: {err:?}");
+                                    stop_cast();
+                                    return;
+                                }
+                            };
+
+                            let (modifier, plane_count) = match find_preferred_modifier(
+                                gbm,
+                                format_size,
+                                fourcc,
+                                modifiers,
+                            ) {
+                                Ok(x) => x,
+                                Err(err) => {
+                                    warn!("couldn't find preferred modifier: {err:?}");
+                                    stop_cast();
+                                    return;
+                                }
+                            };
+
+                            debug!(
+                                "allocation successful \
+                                     (modifier={modifier:?}, plane_count={plane_count}), \
+                                     moving to confirmation pending"
+                            );
+
+                            *state = CastState::ConfirmationPending {
+                                size: format_size,
+                                alpha: format_has_alpha,
+                                dma_negotiation: Some(DmaNegotiation {
+                                    modifier,
+                                    plane_count: plane_count as i32,
+                                }),
+                            };
+
+                            let o = make_video_params(
+                                format.format(),
+                                &[modifier],
+                                format_size,
+                                inner.refresh,
+                            );
+                            let mut b = Vec::new();
+                            let pod = make_pod(&mut b, o);
+
+                            make_params!(
+                                params,
+                                &formats,
+                                format_size,
+                                inner.refresh,
+                                format_has_alpha
+                            );
+                            params.insert(0, pod);
+
+                            if let Err(err) = stream.update_params(&mut params) {
+                                warn!("error updating stream params: {err:?}");
+                                stop_cast();
                             }
 
-                            debug!("wrong size, waiting");
                             return;
                         }
+                        _ => (),
+                    }
 
-                        let format_has_alpha = format.format() == VideoFormat::BGRA;
-                        let fourcc = if format_has_alpha {
-                            Fourcc::Argb8888
-                        } else {
-                            Fourcc::Xrgb8888
-                        };
-
-                        let max_frame_rate = format.max_framerate();
-                        let min_frame_time = Duration::from_micros(
-                            1_000_000 * u64::from(max_frame_rate.denom)
-                                / u64::from(max_frame_rate.num),
-                        );
-                        inner.min_time_between_frames = min_frame_time;
-
-                        // We have following cases when param_changed:
-                        //
-                        // 1. Modifier exists and its flags contain DONT_FIXATE
-                        //
-                        //    Do test allocation, set CastState to ConfirmationPending and send
-                        //    param again.
-                        //
-                        // 2. Modifier exists and it doesn't need fixation
-                        //
-                        //    Do test allocation to ensure the modifier work, then set CastState to
-                        //    Ready. Then set buffer to DMA.
-                        //
-                        // 3. Modifier doesn't exist
-                        //
-                        //    Set CastState to Ready and set buffer to SHM.
-
-                        let object = pod.as_object().unwrap();
-                        let prop_modifier =
-                            object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
-
-                        match prop_modifier {
-                            Some(prop_modifier)
-                                if prop_modifier.flags().contains(PodPropFlags::DONT_FIXATE) =>
+                    let o1 = if prop_modifier.is_some() {
+                        // Verify that alpha and modifier didn't change.
+                        let plane_count = match &*state {
+                            CastState::ConfirmationPending {
+                                size,
+                                alpha,
+                                dma_negotiation: Some(dma_negotiation),
+                            }
+                            | CastState::Ready {
+                                size,
+                                alpha,
+                                dma_negotiation: Some(dma_negotiation),
+                                ..
+                            } if *alpha == format_has_alpha
+                                && dma_negotiation.modifier
+                                    == Modifier::from(format.modifier()) =>
                             {
-                                debug!(flags = ?prop_modifier.flags(), "fixating the modifier");
+                                let size = *size;
+                                let alpha = *alpha;
+                                let dma_negotiation = *dma_negotiation;
 
+                                let (damage_tracker, cursor_damage_tracker) =
+                                    if let CastState::Ready {
+                                        damage_tracker,
+                                        cursor_damage_tracker,
+                                        ..
+                                    } = &mut *state
+                                    {
+                                        (damage_tracker.take(), cursor_damage_tracker.take())
+                                    } else {
+                                        (None, None)
+                                    };
+
+                                debug!("moving to ready state");
+
+                                *state = CastState::Ready {
+                                    size,
+                                    alpha,
+                                    dma_negotiation: Some(dma_negotiation),
+                                    damage_tracker,
+                                    cursor_damage_tracker,
+                                    pending_frame: PendingFrame::default(),
+                                };
+
+                                dma_negotiation.plane_count
+                            }
+                            _ => {
                                 let Some(gbm) = &gbm else {
                                     error!("negotiated dmabuf without gbm");
                                     stop_cast();
                                     return;
                                 };
 
-                                let pod_modifier = prop_modifier.value();
-                                let modifiers = match parse_modifier_candidates(pod_modifier) {
-                                    Ok(modifiers) => modifiers,
-                                    Err(err) => {
-                                        warn!("invalid modifier property: {err:?}");
-                                        stop_cast();
-                                        return;
-                                    }
-                                };
-
+                                // We're negotiating a single modifier, or alpha or modifier
+                                // changed, so we need to do a test allocation.
                                 let (modifier, plane_count) = match find_preferred_modifier(
                                     gbm,
                                     format_size,
                                     fourcc,
-                                    modifiers,
+                                    vec![format.modifier() as i64],
                                 ) {
                                     Ok(x) => x,
                                     Err(err) => {
-                                        warn!("couldn't find preferred modifier: {err:?}");
+                                        warn!("test allocation failed: {err:?}");
                                         stop_cast();
                                         return;
                                     }
@@ -645,284 +797,169 @@ impl PipeWire {
 
                                 debug!(
                                     "allocation successful \
-                                     (modifier={modifier:?}, plane_count={plane_count}), \
-                                     moving to confirmation pending"
+                                         (modifier={modifier:?}, plane_count={plane_count}), \
+                                         moving to ready"
                                 );
 
-                                *state = CastState::ConfirmationPending {
+                                *state = CastState::Ready {
                                     size: format_size,
                                     alpha: format_has_alpha,
                                     dma_negotiation: Some(DmaNegotiation {
                                         modifier,
                                         plane_count: plane_count as i32,
                                     }),
+                                    damage_tracker: None,
+                                    cursor_damage_tracker: None,
+                                    pending_frame: PendingFrame::default(),
                                 };
 
-                                let o = make_video_params(
-                                    format.format(),
-                                    &[modifier],
-                                    format_size,
-                                    inner.refresh,
-                                );
-                                let mut b = Vec::new();
-                                let pod = make_pod(&mut b, o);
-
-                                make_params!(
-                                    params,
-                                    &formats,
-                                    format_size,
-                                    inner.refresh,
-                                    format_has_alpha
-                                );
-                                params.insert(0, pod);
-
-                                if let Err(err) = stream.update_params(&mut params) {
-                                    warn!("error updating stream params: {err:?}");
-                                    stop_cast();
-                                }
-
-                                return;
+                                plane_count as i32
                             }
-                            _ => (),
-                        }
-
-                        let o1 = if prop_modifier.is_some() {
-                            // Verify that alpha and modifier didn't change.
-                            let plane_count = match &*state {
-                                CastState::ConfirmationPending {
-                                    size,
-                                    alpha,
-                                    dma_negotiation: Some(dma_negotiation),
-                                }
-                                | CastState::Ready {
-                                    size,
-                                    alpha,
-                                    dma_negotiation: Some(dma_negotiation),
-                                    ..
-                                } if *alpha == format_has_alpha
-                                    && dma_negotiation.modifier
-                                        == Modifier::from(format.modifier()) =>
-                                {
-                                    let size = *size;
-                                    let alpha = *alpha;
-                                    let dma_negotiation = *dma_negotiation;
-
-                                    let (damage_tracker, cursor_damage_tracker) =
-                                        if let CastState::Ready {
-                                            damage_tracker,
-                                            cursor_damage_tracker,
-                                            ..
-                                        } = &mut *state
-                                        {
-                                            (damage_tracker.take(), cursor_damage_tracker.take())
-                                        } else {
-                                            (None, None)
-                                        };
-
-                                    debug!("moving to ready state");
-
-                                    *state = CastState::Ready {
-                                        size,
-                                        alpha,
-                                        dma_negotiation: Some(dma_negotiation),
-                                        damage_tracker,
-                                        cursor_damage_tracker,
-                                        last_cursor_location: None,
-                                    };
-
-                                    dma_negotiation.plane_count
-                                }
-                                _ => {
-                                    let Some(gbm) = &gbm else {
-                                        error!("negotiated dmabuf without gbm");
-                                        stop_cast();
-                                        return;
-                                    };
-
-                                    // We're negotiating a single modifier, or alpha or modifier
-                                    // changed, so we need to do a test allocation.
-                                    let (modifier, plane_count) = match find_preferred_modifier(
-                                        gbm,
-                                        format_size,
-                                        fourcc,
-                                        vec![format.modifier() as i64],
-                                    ) {
-                                        Ok(x) => x,
-                                        Err(err) => {
-                                            warn!("test allocation failed: {err:?}");
-                                            stop_cast();
-                                            return;
-                                        }
-                                    };
-
-                                    debug!(
-                                        "allocation successful \
-                                         (modifier={modifier:?}, plane_count={plane_count}), \
-                                         moving to ready"
-                                    );
-
-                                    *state = CastState::Ready {
-                                        size: format_size,
-                                        alpha: format_has_alpha,
-                                        dma_negotiation: Some(DmaNegotiation {
-                                            modifier,
-                                            plane_count: plane_count as i32,
-                                        }),
-                                        damage_tracker: None,
-                                        cursor_damage_tracker: None,
-                                        last_cursor_location: None,
-                                    };
-
-                                    plane_count as i32
-                                }
-                            };
-
-                            pod::object!(
-                                SpaTypes::ObjectParamBuffers,
-                                ParamType::Buffers,
-                                Property::new(
-                                    SPA_PARAM_BUFFERS_buffers,
-                                    pod::Value::Choice(ChoiceValue::Int(Choice(
-                                        ChoiceFlags::empty(),
-                                        ChoiceEnum::Range {
-                                            default: 8,
-                                            min: 2,
-                                            max: 16
-                                        }
-                                    ))),
-                                ),
-                                Property::new(
-                                    SPA_PARAM_BUFFERS_blocks,
-                                    pod::Value::Int(plane_count)
-                                ),
-                                Property::new(
-                                    SPA_PARAM_BUFFERS_dataType,
-                                    pod::Value::Choice(ChoiceValue::Int(Choice(
-                                        ChoiceFlags::empty(),
-                                        ChoiceEnum::Flags {
-                                            default: 1 << DataType::DmaBuf.as_raw(),
-                                            flags: vec![1 << DataType::DmaBuf.as_raw()],
-                                        },
-                                    ))),
-                                ),
-                            )
-                        } else {
-                            debug!("negotiated inefficient shm stream, moving to ready state");
-
-                            *state = CastState::Ready {
-                                size: format_size,
-                                alpha: format_has_alpha,
-                                dma_negotiation: None,
-                                damage_tracker: None,
-                                cursor_damage_tracker: None,
-                                last_cursor_location: None,
-                            };
-                            pod::object!(
-                                SpaTypes::ObjectParamBuffers,
-                                ParamType::Buffers,
-                                Property::new(
-                                    SPA_PARAM_BUFFERS_buffers,
-                                    pod::Value::Choice(ChoiceValue::Int(Choice(
-                                        ChoiceFlags::empty(),
-                                        ChoiceEnum::Range {
-                                            default: 8,
-                                            min: 2,
-                                            max: 16
-                                        }
-                                    ))),
-                                ),
-                                Property::new(
-                                    SPA_PARAM_BUFFERS_blocks,
-                                    pod::Value::Int(SHM_BLOCKS as i32),
-                                ),
-                                Property::new(
-                                    SPA_PARAM_BUFFERS_dataType,
-                                    pod::Value::Choice(ChoiceValue::Int(Choice(
-                                        ChoiceFlags::empty(),
-                                        ChoiceEnum::Flags {
-                                            default: 1 << DataType::MemFd.as_raw(),
-                                            flags: vec![1 << DataType::MemFd.as_raw()],
-                                        },
-                                    ))),
-                                ),
-                            )
                         };
 
-                        let o2 = pod::object!(
+                        pod::object!(
+                            SpaTypes::ObjectParamBuffers,
+                            ParamType::Buffers,
+                            Property::new(
+                                SPA_PARAM_BUFFERS_buffers,
+                                pod::Value::Choice(ChoiceValue::Int(Choice(
+                                    ChoiceFlags::empty(),
+                                    ChoiceEnum::Range {
+                                        default: 8,
+                                        min: 2,
+                                        max: 16
+                                    }
+                                ))),
+                            ),
+                            Property::new(SPA_PARAM_BUFFERS_blocks, pod::Value::Int(plane_count)),
+                            Property::new(
+                                SPA_PARAM_BUFFERS_dataType,
+                                pod::Value::Choice(ChoiceValue::Int(Choice(
+                                    ChoiceFlags::empty(),
+                                    ChoiceEnum::Flags {
+                                        default: 1 << DataType::DmaBuf.as_raw(),
+                                        flags: vec![1 << DataType::DmaBuf.as_raw()],
+                                    },
+                                ))),
+                            ),
+                        )
+                    } else {
+                        debug!("negotiated inefficient shm stream, moving to ready state");
+
+                        *state = CastState::Ready {
+                            size: format_size,
+                            alpha: format_has_alpha,
+                            dma_negotiation: None,
+                            damage_tracker: None,
+                            cursor_damage_tracker: None,
+                            pending_frame: PendingFrame::default(),
+                        };
+                        pod::object!(
+                            SpaTypes::ObjectParamBuffers,
+                            ParamType::Buffers,
+                            Property::new(
+                                SPA_PARAM_BUFFERS_buffers,
+                                pod::Value::Choice(ChoiceValue::Int(Choice(
+                                    ChoiceFlags::empty(),
+                                    ChoiceEnum::Range {
+                                        default: 8,
+                                        min: 2,
+                                        max: 16
+                                    }
+                                ))),
+                            ),
+                            Property::new(
+                                SPA_PARAM_BUFFERS_blocks,
+                                pod::Value::Int(SHM_BLOCKS as i32),
+                            ),
+                            Property::new(
+                                SPA_PARAM_BUFFERS_dataType,
+                                pod::Value::Choice(ChoiceValue::Int(Choice(
+                                    ChoiceFlags::empty(),
+                                    ChoiceEnum::Flags {
+                                        default: 1 << DataType::MemFd.as_raw(),
+                                        flags: vec![1 << DataType::MemFd.as_raw()],
+                                    },
+                                ))),
+                            ),
+                        )
+                    };
+
+                    let o2 = pod::object!(
+                        SpaTypes::ObjectParamMeta,
+                        ParamType::Meta,
+                        Property::new(
+                            SPA_PARAM_META_type,
+                            pod::Value::Id(spa::utils::Id(SPA_META_Header))
+                        ),
+                        Property::new(
+                            SPA_PARAM_META_size,
+                            pod::Value::Int(size_of::<spa_meta_header>() as i32)
+                        ),
+                    );
+
+                    let mut b1 = vec![];
+                    let mut b2 = vec![];
+
+                    let mut params = vec![make_pod(&mut b1, o1), make_pod(&mut b2, o2)];
+
+                    let mut b_cursor = vec![];
+                    if cursor_mode == CursorMode::Metadata {
+                        let o_cursor = pod::object!(
                             SpaTypes::ObjectParamMeta,
                             ParamType::Meta,
                             Property::new(
                                 SPA_PARAM_META_type,
-                                pod::Value::Id(spa::utils::Id(SPA_META_Header))
+                                pod::Value::Id(spa::utils::Id(SPA_META_Cursor))
                             ),
                             Property::new(
                                 SPA_PARAM_META_size,
-                                pod::Value::Int(size_of::<spa_meta_header>() as i32)
+                                pod::Value::Int(CURSOR_META_SIZE as i32)
                             ),
                         );
+                        params.push(make_pod(&mut b_cursor, o_cursor));
+                    }
 
-                        let mut b1 = vec![];
-                        let mut b2 = vec![];
+                    if let Err(err) = stream.update_params(&mut params) {
+                        warn!("error updating stream params: {err:?}");
+                        stop_cast();
+                    }
+                }
+            })
+            .add_buffer({
+                let inner = inner.clone();
+                let stop_cast = stop_cast.clone();
+                move |stream, (), buffer| {
+                    let _span = debug_span!("add_buffer", %stream_id).entered();
 
-                        let mut params = vec![make_pod(&mut b1, o1), make_pod(&mut b2, o2)];
-
-                        let mut b_cursor = vec![];
-                        if cursor_mode == CursorMode::Metadata {
-                            let o_cursor = pod::object!(
-                                SpaTypes::ObjectParamMeta,
-                                ParamType::Meta,
-                                Property::new(
-                                    SPA_PARAM_META_type,
-                                    pod::Value::Id(spa::utils::Id(SPA_META_Cursor))
-                                ),
-                                Property::new(
-                                    SPA_PARAM_META_size,
-                                    pod::Value::Int(CURSOR_META_SIZE as i32)
-                                ),
-                            );
-                            params.push(make_pod(&mut b_cursor, o_cursor));
+                    match unsafe { inner.borrow_mut().on_add_buffer(gbm.as_ref(), buffer) } {
+                        Ok(redraw) => {
+                            // During size re-negotiation, the stream sometimes just keeps
+                            // running, in which case we may need to force a redraw once we got
+                            // a newly sized buffer.
+                            if redraw && stream.state() == StreamState::Streaming {
+                                redraw_();
+                            }
                         }
-
-                        if let Err(err) = stream.update_params(&mut params) {
-                            warn!("error updating stream params: {err:?}");
+                        Err(err) => {
+                            warn!("error adding pw buffer: {err:?}");
                             stop_cast();
                         }
-                    }
-                })
-                .add_buffer({
-                    let inner = inner.clone();
-                    let stop_cast = stop_cast.clone();
-                    move |stream, (), buffer| {
-                        let _span = debug_span!("add_buffer", %stream_id).entered();
+                    };
+                }
+            })
+            .remove_buffer({
+                let inner = inner.clone();
+                move |_stream, (), buffer| {
+                    let _span = debug_span!("remove_buffer", %stream_id).entered();
 
-                        match unsafe { inner.borrow_mut().on_add_buffer(gbm.as_ref(), buffer) } {
-                            Ok(redraw) => {
-                                // During size re-negotiation, the stream sometimes just keeps
-                                // running, in which case we may need to force a redraw once we got
-                                // a newly sized buffer.
-                                if redraw && stream.state() == StreamState::Streaming {
-                                    redraw_();
-                                }
-                            }
-                            Err(err) => {
-                                warn!("error adding pw buffer: {err:?}");
-                                stop_cast();
-                            }
-                        };
+                    unsafe {
+                        inner.borrow_mut().on_remove_buffer(buffer);
                     }
-                })
-                .remove_buffer({
-                    let inner = inner.clone();
-                    move |_stream, (), buffer| {
-                        let _span = debug_span!("remove_buffer", %stream_id).entered();
-
-                        unsafe {
-                            inner.borrow_mut().on_remove_buffer(buffer);
-                        }
-                    }
-                })
-                .register()
-                .unwrap();
+                }
+            })
+            .register()
+            .unwrap();
 
         trace!("starting pw stream with size={pending_size:?}, refresh={refresh:?}");
 
@@ -953,6 +990,7 @@ impl PipeWire {
             scheduled_redraw: None,
             sequence_counter: 0,
             inner,
+            waiting_for_buffer,
         };
         Ok(cast)
     }
@@ -1132,7 +1170,9 @@ impl Cast {
     }
 
     fn dequeue_available_buffer(&mut self) -> Option<NonNull<pw_buffer>> {
-        unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }
+        let buffer = unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) };
+        self.waiting_for_buffer.set(buffer.is_none());
+        buffer
     }
 
     fn queue_completed_buffers(&mut self) {
@@ -1229,7 +1269,7 @@ impl Cast {
         let CastState::Ready {
             damage_tracker,
             cursor_damage_tracker,
-            last_cursor_location,
+            pending_frame,
             ..
         } = &mut inner.state
         else {
@@ -1259,8 +1299,7 @@ impl Cast {
             );
         }
 
-        let mut has_cursor_update = false;
-        let mut redraw_cursor = false;
+        let mut cursor_damaged = false;
 
         // For embedded cursor, pass the full slice (cursor + main) to the damage tracker.
         // For metadata or hidden cursor, pass only the main elements.
@@ -1273,16 +1312,16 @@ impl Cast {
             let (damage, _states) = cursor_damage_tracker
                 .damage_output(1, &cursor_data.relocated)
                 .unwrap();
-            redraw_cursor = damage.is_some();
-            has_cursor_update =
-                redraw_cursor || *last_cursor_location != Some(cursor_data.location);
+            cursor_damaged = damage.is_some();
         }
 
-        if damage.is_none() && !has_cursor_update {
+        let cursor_location =
+            (self.cursor_mode == CursorMode::Metadata).then_some(cursor_data.location);
+        if !pending_frame.update(damage.is_some(), cursor_damaged, cursor_location) {
             trace!("no damage, skipping frame");
             return false;
         }
-        *last_cursor_location = Some(cursor_data.location);
+        let redraw_cursor = pending_frame.cursor_damaged;
         drop(inner);
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
@@ -1354,6 +1393,12 @@ impl Cast {
                 )),
             };
 
+            if res.is_ok() {
+                let CastState::Ready { pending_frame, .. } = &mut inner.state else {
+                    unreachable!()
+                };
+                pending_frame.submitted(cursor_location);
+            }
             drop(inner);
             match res {
                 Ok((sync_point, buf)) => {
@@ -1384,11 +1429,13 @@ impl Cast {
         if let CastState::Ready {
             damage_tracker,
             cursor_damage_tracker,
+            pending_frame,
             ..
         } = &mut inner.state
         {
             *damage_tracker = None;
             *cursor_damage_tracker = None;
+            *pending_frame = PendingFrame::default();
         };
         drop(inner);
 
@@ -2027,6 +2074,38 @@ fn clear_shmbuf(buffer: &Shmbuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backpressure_preserves_final_content_and_cursor_bitmap() {
+        let mut frame = PendingFrame::default();
+        let location = Some(Point::from((50, 60)));
+        frame.submitted(location);
+
+        // The damage trackers see a single change, but the consumer owns all buffers.
+        assert!(frame.update(true, true, location));
+        // Subsequent identical frames have no new damage. The pending update must still render,
+        // including the cursor bitmap, once a buffer becomes available.
+        for _ in 0..3 {
+            assert!(frame.update(false, false, location));
+            assert!(frame.cursor_damaged);
+        }
+        frame.submitted(location);
+        assert!(!frame.update(false, false, location));
+    }
+
+    #[test]
+    fn backpressure_preserves_final_cursor_movement() {
+        let mut frame = PendingFrame::default();
+        let initial = Some(Point::from((50, 60)));
+        let moved = Some(Point::from((80, 90)));
+        frame.submitted(initial);
+        assert!(frame.update(false, false, moved));
+        assert!(frame.update(false, false, moved));
+        assert_eq!(frame.last_cursor_location, initial);
+        assert!(!frame.cursor_damaged);
+        frame.submitted(moved);
+        assert!(!frame.update(false, false, moved));
+    }
 
     fn modifier_candidates(value: pod::Value) -> anyhow::Result<Vec<i64>> {
         let mut object =
