@@ -5819,12 +5819,14 @@ impl Niri {
     /// Explicit clients receive release fences, and implicit clients receive READ fences in
     /// every DMA-BUF plane's reservation object. The conservative surface traversal also
     /// includes hidden and scanned-out buffers; adding a rendering dependency is harmless.
+    /// Shared DMA-BUFs only need one implicit import, but each buffer keeps its explicit fence.
     /// If fence export or import fails, wait for this submission before allowing release.
     pub fn stamp_release_fences(&self, output: &Output, sync: &SyncPoint) {
-        use crate::render_helpers::dmabuf_sync::{import_read_fence, with_read_fence};
+        use crate::render_helpers::dmabuf_sync::{with_read_fence, ReadFenceImports};
 
         with_read_fence(sync, |fence| {
             let mut result = Ok(());
+            let mut imported = ReadFenceImports::default();
             self.for_each_output_surface(output, |_, states| {
                 if let Some(state) = states.data_map.get::<RendererSurfaceStateUserData>() {
                     if let Some(buffer) = state.lock().unwrap().buffer() {
@@ -5833,7 +5835,7 @@ impl Niri {
                         // implicit imports are needed. Keep stamping explicit release points.
                         if result.is_ok() {
                             if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(buffer) {
-                                result = import_read_fence(dmabuf, fence);
+                                result = imported.import(dmabuf, fence);
                             }
                         }
                     }
