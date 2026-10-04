@@ -37,7 +37,6 @@ use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
-use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::move_grab::MoveGrab;
@@ -2513,58 +2512,24 @@ impl State {
         self.niri.pointer_visibility = PointerVisibility::Visible;
         self.niri.tablet_cursor_location = None;
 
-        // Check if we have an active pointer constraint.
-        //
-        // FIXME: ideally this should use the pointer focus with up-to-date global location.
+        let constraint = pointer_constraints::active_constraint(&self.niri);
         let mut pointer_confined = None;
-        if let Some(under) = &self.niri.pointer_contents.surface {
-            // No need to check if the pointer focus surface matches, because here we're checking
-            // for an already-active constraint, and the constraint is deactivated when the focused
-            // surface changes.
-            let pos_within_surface = pos - under.1;
-
-            let mut pointer_locked = false;
-            with_pointer_constraint(&under.0, &pointer, |constraint| {
-                let Some(constraint) = constraint else { return };
-                if !constraint.is_active() {
-                    return;
-                }
-
-                // Constraint does not apply if not within region.
-                if let Some(region) = constraint.region() {
-                    if !region.contains(pos_within_surface.to_i32_floor()) {
-                        return;
-                    }
-                }
-
-                match &*constraint {
-                    PointerConstraint::Locked(_locked) => {
-                        pointer_locked = true;
-                    }
-                    PointerConstraint::Confined(confine) => {
-                        pointer_confined = Some((under.clone(), confine.region().cloned()));
-                    }
-                }
-            });
-
-            // If the pointer is locked, only send relative motion.
-            if pointer_locked {
+        if let Some(constraint) = constraint {
+            // Locked relative devices still send their unmodified relative motion to the client.
+            if constraint.locked {
                 pointer.relative_motion(
                     self,
-                    Some(under.clone()),
+                    Some(constraint.focus),
                     &RelativeMotionEvent {
                         delta: event.delta(),
                         delta_unaccel: event.delta_unaccel(),
                         time: event.time(),
                     },
                 );
-
                 pointer.frame(self);
-
-                // I guess a redraw to hide the tablet cursor could be nice? Doesn't matter too
-                // much here I think.
                 return;
             }
+            pointer_confined = Some((constraint.focus, constraint.region));
         }
 
         // Warp pointer across the screen during the spatial movement grabs.
@@ -2748,7 +2713,7 @@ impl State {
         // Any of the early returns here mean that the pointer is not inside the hot corner.
         self.niri.pointer_inside_hot_corner = false;
 
-        let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
+        let Some(mut pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
                 event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
             })
@@ -2759,6 +2724,29 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         let pointer = self.niri.seat.get_pointer().unwrap();
+
+        let constraint = pointer_constraints::active_constraint(&self.niri);
+        if let Some(constraint) = &constraint {
+            if constraint.locked {
+                // An absolute device has no relative delta to send. Keep the locked position.
+                pointer.frame(self);
+                return;
+            }
+            pos = pointer_constraints::confine_motion(
+                &constraint.focus.0,
+                constraint.focus.1,
+                constraint.region.as_ref(),
+                pointer.current_location(),
+                pos,
+            );
+        }
+        let under = self.niri.contents_under(pos);
+        if constraint.as_ref().is_some_and(|constraint| {
+            Some(&constraint.focus.0) != under.surface.as_ref().map(|(surface, _)| surface)
+        }) {
+            pointer.frame(self);
+            return;
+        }
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
@@ -2776,8 +2764,6 @@ impl State {
                 }
             }
         }
-
-        let under = self.niri.contents_under(pos);
 
         self.niri.handle_focus_follows_mouse(&under);
 

@@ -6,6 +6,37 @@ use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::compositor::{
     with_states, RectangleKind, RegionAttributes, SurfaceAttributes,
 };
+use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
+
+use crate::niri::Niri;
+
+pub(super) struct ActiveConstraint {
+    pub focus: (WlSurface, Point<f64, Logical>),
+    pub locked: bool,
+    pub region: Option<RegionAttributes>,
+}
+
+/// Both relative and absolute devices must honor the constraint at the current location.
+pub(super) fn active_constraint(niri: &Niri) -> Option<ActiveConstraint> {
+    let pointer = niri.seat.get_pointer().unwrap();
+    let focus = niri.pointer_contents.surface.as_ref()?;
+    let position = pointer.current_location() - focus.1;
+    with_pointer_constraint(&focus.0, &pointer, |constraint| {
+        let constraint = constraint?;
+        if !constraint.is_active()
+            || constraint
+                .region()
+                .is_some_and(|region| !region.contains(position.to_i32_floor()))
+        {
+            return None;
+        }
+        Some(ActiveConstraint {
+            focus: focus.clone(),
+            locked: matches!(&*constraint, PointerConstraint::Locked(_)),
+            region: constraint.region().cloned(),
+        })
+    })
+}
 
 pub(super) fn confine_motion(
     surface: &WlSurface,

@@ -19,6 +19,11 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_info_v1::{self, WpImageDescriptionInfoV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_v1::{self, WpImageDescriptionV1};
+use smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+    zwp_locked_pointer_v1::ZwpLockedPointerV1,
+    zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+};
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -45,6 +50,9 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_pointer::WlPointer;
+use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
@@ -73,6 +81,8 @@ pub struct State {
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
+    pub pointer_constraints: Option<ZwpPointerConstraintsV1>,
+    pub seat: Option<WlSeat>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
@@ -225,6 +235,8 @@ impl Client {
             xdg_wm_base: None,
             layer_shell: None,
             virtual_pointer_manager: None,
+            pointer_constraints: None,
+            seat: None,
             spbm: None,
             shm: None,
             viewporter: None,
@@ -277,8 +289,8 @@ impl Client {
         self.state.window(surface)
     }
 
-    /// Drives the color-management requests `wayland-info` sends: bind an output's image description
-    /// and query its information.
+    /// Drives the color-management requests `wayland-info` sends: bind an output's image
+    /// description and query its information.
     pub fn probe_output_color_management(&mut self) {
         let manager = self.state.color_manager.clone().expect("manager not bound");
         let output = self.state.outputs.keys().next().expect("no output").clone();
@@ -844,6 +856,10 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrVirtualPointerManagerV1::interface().name {
                     let version = min(version, ZwlrVirtualPointerManagerV1::interface().version);
                     state.virtual_pointer_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpPointerConstraintsV1::interface().name {
+                    state.pointer_constraints = Some(registry.bind(name, 1, qh, ()));
+                } else if interface == WlSeat::interface().name {
+                    state.seat = Some(registry.bind(name, min(version, 9), qh, ()));
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
@@ -974,6 +990,12 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
     }
 }
 
+wayland_client::delegate_noop!(State: ignore WlSeat);
+wayland_client::delegate_noop!(State: ignore WlPointer);
+wayland_client::delegate_noop!(State: WlRegion);
+wayland_client::delegate_noop!(State: ZwpPointerConstraintsV1);
+wayland_client::delegate_noop!(State: ignore ZwpLockedPointerV1);
+wayland_client::delegate_noop!(State: ignore ZwpConfinedPointerV1);
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerManagerV1);
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerV1);
 
