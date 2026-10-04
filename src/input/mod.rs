@@ -140,8 +140,17 @@ impl State {
     {
         let _span = tracy_client::span!("process_input_event");
 
-        // Make sure some logic like workspace clean-up has a chance to run before doing actions.
-        self.niri.advance_animations();
+        // The animation clock is fixed for this dispatch batch. Ordinary high-rate motion only
+        // needs maintenance once; actions and grabs still need it before each event because
+        // maintenance also updates workspace cleanup, DnD targets, and edge scrolling.
+        let ordinary_motion = matches!(
+            &event,
+            InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
+        ) && !pointer_redraw::needs_all_outputs(&self.niri);
+        if !ordinary_motion || !self.niri.input_motion_animations_advanced {
+            self.niri.advance_animations();
+        }
+        self.niri.input_motion_animations_advanced = ordinary_motion;
 
         if self.niri.monitors_active {
             // Notify the idle-notifier of activity.

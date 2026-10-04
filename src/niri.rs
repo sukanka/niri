@@ -410,6 +410,8 @@ pub struct Niri {
     /// Used for limiting the reset to once per iteration, so that it's not spammed with high
     /// resolution mice.
     pub pointer_inactivity_timer_got_reset: bool,
+    /// Ordinary pointer events share the animation clock within one dispatch batch.
+    pub input_motion_animations_advanced: bool,
     /// Whether the (idle notifier) activity was notified this event loop iteration.
     ///
     /// Used for limiting the notify to once per iteration, so that it's not spammed with high
@@ -901,6 +903,7 @@ impl State {
 
         // Clear the time so it's fetched afresh next iteration.
         self.niri.clock.clear();
+        self.niri.input_motion_animations_advanced = false;
         self.niri.pointer_inactivity_timer_got_reset = false;
         self.niri.notified_activity_this_iteration = false;
     }
@@ -3301,6 +3304,7 @@ impl Niri {
             pointer_visibility: PointerVisibility::Visible,
             pointer_inactivity_timer: None,
             pointer_inactivity_timer_got_reset: false,
+            input_motion_animations_advanced: false,
             notified_activity_this_iteration: false,
             pointer_inside_hot_corner: false,
             pointer_constraint_position_hint: None,

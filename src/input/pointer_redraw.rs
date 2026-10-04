@@ -79,7 +79,7 @@ impl MotionRedraw {
     }
 }
 
-fn needs_all_outputs(niri: &Niri) -> bool {
+pub(super) fn needs_all_outputs(niri: &Niri) -> bool {
     niri.seat.get_pointer().unwrap().is_grabbed()
         || niri.dnd_icon.is_some()
         || niri.screenshot_ui.is_open()
