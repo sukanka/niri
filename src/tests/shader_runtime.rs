@@ -21,12 +21,19 @@ use smithay::backend::renderer::element::surface::{
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::{Element as _, Kind};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::{Element as _, Id, Kind};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::renderer::{Renderer as _, Texture as _};
+use smithay::desktop::layer_map_for_output;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer as ClientLayer;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerSurface;
 use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
+use smithay::wayland::compositor::with_states;
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use super::client::ClientId;
+use super::client::{ClientId, LayerConfigureProps};
 use super::{gpu, Fixture};
 use crate::backend::tty::wayland_scanout_candidates;
 use crate::backend::tty_renderer::TtyOffscreen;
@@ -728,9 +735,324 @@ fn wayland_scanout_candidates_exclude_clipped_and_offscreen_gles() {
     assert!(wayland_scanout_candidates(renderer, &[offscreen]).is_empty());
 }
 
+/// Building an element already imports its buffer. Verify the fullscreen fast path before
+/// drawing, then verify that the first visible frame imports the most recent hidden buffers.
+#[test]
+fn fullscreen_avoids_hidden_window_and_wallpaper_imports_gles() {
+    let Some(mut f) = set_up(no_animation_config()) else {
+        return;
+    };
+    let (wallpaper_client, wallpaper, server_wallpaper) =
+        add_textured_layer(&mut f, ClientLayer::Background, "import-wallpaper");
+    let (background_client, background) = add_window(&mut f);
+    let server_background = focused_server_surface(&mut f);
+    let (game_client, game) = add_window(&mut f);
+    change_fullscreen(&mut f, game_client, &game, true);
+    settle(&mut f);
+
+    replace_window_buffer(&mut f, background_client, &background, (37, 29));
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (53, 41));
+    assert_eq!(imported_texture_size(&mut f, &server_background), None);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+
+    let ids = scene_element_ids(&mut f, RenderTarget::Output);
+    assert!(!ids.contains(&Id::from_wayland_resource(&server_background)));
+    assert!(!ids.contains(&Id::from_wayland_resource(&server_wallpaper)));
+    assert_eq!(imported_texture_size(&mut f, &server_background), None);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+
+    // Changes arriving while the game stays fullscreen must not be lost or imported early.
+    replace_window_buffer(&mut f, background_client, &background, (43, 31));
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (59, 47));
+    scene_element_ids(&mut f, RenderTarget::Output);
+    assert_eq!(imported_texture_size(&mut f, &server_background), None);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+
+    change_fullscreen(&mut f, game_client, &game, false);
+    settle(&mut f);
+    let ids = scene_element_ids(&mut f, RenderTarget::Output);
+    assert!(ids.contains(&Id::from_wayland_resource(&server_background)));
+    assert!(ids.contains(&Id::from_wayland_resource(&server_wallpaper)));
+    assert_eq!(
+        imported_texture_size(&mut f, &server_background),
+        Some((43, 31))
+    );
+    assert_eq!(
+        imported_texture_size(&mut f, &server_wallpaper),
+        Some((59, 47))
+    );
+}
+
+#[test]
+fn fullscreen_xray_overlay_restores_background_imports_gles() {
+    let mut config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^import-overlay$"
+            opacity 0.7
+            background-effect {
+                xray true
+                blur true
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    config.animations.off = true;
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let (wallpaper_client, wallpaper, server_wallpaper) =
+        add_textured_layer(&mut f, ClientLayer::Background, "import-wallpaper");
+    let (game_client, game) = add_window(&mut f);
+    change_fullscreen(&mut f, game_client, &game, true);
+    settle(&mut f);
+
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (53, 41));
+    scene_element_ids(&mut f, RenderTarget::Output);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+
+    let (overlay_client, overlay, server_overlay) =
+        add_textured_layer(&mut f, ClientLayer::Overlay, "import-overlay");
+    settle(&mut f);
+    let ids = scene_element_ids(&mut f, RenderTarget::Output);
+    assert!(ids.contains(&Id::from_wayland_resource(&server_overlay)));
+    assert_eq!(
+        imported_texture_size(&mut f, &server_wallpaper),
+        Some((53, 41))
+    );
+    let audit = render_scene(&mut f, None);
+    assert!(
+        audit.texture_programs.contains(&"postprocess_and_clip"),
+        "the overlay must still sample its xray background: {:?}",
+        audit.texture_programs
+    );
+
+    let layer = f.client(overlay_client).layer(&overlay);
+    layer.attach_null();
+    layer.commit();
+    f.double_roundtrip(overlay_client);
+    settle(&mut f);
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (61, 43));
+    scene_element_ids(&mut f, RenderTarget::Output);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+}
+
+#[test]
+fn fullscreen_overview_restores_hidden_surface_imports_gles() {
+    let Some(mut f) = set_up(no_animation_config()) else {
+        return;
+    };
+    let (wallpaper_client, wallpaper, server_wallpaper) =
+        add_textured_layer(&mut f, ClientLayer::Background, "import-wallpaper");
+    let (background_client, background) = add_window(&mut f);
+    let server_background = focused_server_surface(&mut f);
+    let (game_client, game) = add_window(&mut f);
+    change_fullscreen(&mut f, game_client, &game, true);
+    settle(&mut f);
+    replace_window_buffer(&mut f, background_client, &background, (37, 29));
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (53, 41));
+
+    f.niri().layout.toggle_overview();
+    settle(&mut f);
+    let ids = scene_element_ids(&mut f, RenderTarget::Output);
+    assert!(ids.contains(&Id::from_wayland_resource(&server_background)));
+    assert!(ids.contains(&Id::from_wayland_resource(&server_wallpaper)));
+    assert_eq!(
+        imported_texture_size(&mut f, &server_background),
+        Some((37, 29))
+    );
+    assert_eq!(
+        imported_texture_size(&mut f, &server_wallpaper),
+        Some((53, 41))
+    );
+
+    f.niri().layout.toggle_overview();
+    settle(&mut f);
+    replace_window_buffer(&mut f, background_client, &background, (43, 31));
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (59, 47));
+    scene_element_ids(&mut f, RenderTarget::Output);
+    assert_eq!(imported_texture_size(&mut f, &server_background), None);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+}
+
+#[test]
+fn fullscreen_transitions_keep_background_imports_gles() {
+    let config = Config::parse_mem(
+        r#"
+        animations {
+            window-resize {
+                duration-ms 1000
+                curve "linear"
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let (wallpaper_client, wallpaper, server_wallpaper) =
+        add_textured_layer(&mut f, ClientLayer::Background, "import-wallpaper");
+    let (game_client, game) = add_window(&mut f);
+    settle(&mut f);
+
+    change_fullscreen(&mut f, game_client, &game, true);
+    set_time(&mut f, Duration::from_millis(500));
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (53, 41));
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+    let ids = scene_element_ids(&mut f, RenderTarget::Output);
+    assert!(ids.contains(&Id::from_wayland_resource(&server_wallpaper)));
+    assert_eq!(
+        imported_texture_size(&mut f, &server_wallpaper),
+        Some((53, 41))
+    );
+
+    settle(&mut f);
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (59, 47));
+    scene_element_ids(&mut f, RenderTarget::Output);
+    assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+
+    change_fullscreen(&mut f, game_client, &game, false);
+    set_time(&mut f, Duration::from_millis(500));
+    replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (61, 43));
+    let ids = scene_element_ids(&mut f, RenderTarget::Output);
+    assert!(ids.contains(&Id::from_wayland_resource(&server_wallpaper)));
+    assert_eq!(
+        imported_texture_size(&mut f, &server_wallpaper),
+        Some((61, 43))
+    );
+}
+
+#[test]
+fn fullscreen_capture_targets_keep_background_imports_gles() {
+    let Some(mut f) = set_up(no_animation_config()) else {
+        return;
+    };
+    let (wallpaper_client, wallpaper, server_wallpaper) =
+        add_textured_layer(&mut f, ClientLayer::Background, "import-wallpaper");
+    let (game_client, game) = add_window(&mut f);
+    change_fullscreen(&mut f, game_client, &game, true);
+    settle(&mut f);
+
+    for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
+        replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (53, 41));
+        assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+        let ids = scene_element_ids(&mut f, target);
+        assert!(ids.contains(&Id::from_wayland_resource(&server_wallpaper)));
+        assert_eq!(
+            imported_texture_size(&mut f, &server_wallpaper),
+            Some((53, 41))
+        );
+
+        // A capture must not disable the ordinary output's ability to skip hidden imports.
+        replace_layer_buffer(&mut f, wallpaper_client, &wallpaper, (59, 47));
+        scene_element_ids(&mut f, RenderTarget::Output);
+        assert_eq!(imported_texture_size(&mut f, &server_wallpaper), None);
+    }
+}
+
 // =============================================================================
 // Helpers.
 // =============================================================================
+
+fn no_animation_config() -> Config {
+    let mut config = Config::default();
+    config.animations.off = true;
+    config
+}
+
+fn focused_server_surface(f: &mut Fixture) -> ServerSurface {
+    f.niri()
+        .layout
+        .focus()
+        .unwrap()
+        .toplevel()
+        .wl_surface()
+        .clone()
+}
+
+fn add_textured_layer(
+    f: &mut Fixture,
+    layer: ClientLayer,
+    namespace: &str,
+) -> (ClientId, WlSurface, ServerSurface) {
+    let client = f.add_client();
+    let layer = f.client(client).create_layer(None, layer, namespace);
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top | Anchor::Bottom),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(client);
+    let layer = f.client(client).layer(&surface);
+    let (w, h) = layer.configures_received.last().unwrap().1.size;
+    layer.attach_new_shm_buffer(w as u16, h as u16);
+    layer.set_size(w as u16, h as u16);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(client);
+
+    let output = f.niri_output(1);
+    let server_surface = layer_map_for_output(&output)
+        .layers()
+        .find(|layer| layer.namespace() == namespace)
+        .expect("layer must be mapped")
+        .wl_surface()
+        .clone();
+    (client, surface, server_surface)
+}
+
+fn replace_window_buffer(f: &mut Fixture, client: ClientId, surface: &WlSurface, size: (u16, u16)) {
+    let window = f.client(client).window(surface);
+    window.attach_new_shm_buffer(size.0, size.1);
+    window.surface.commit();
+    f.double_roundtrip(client);
+}
+
+fn replace_layer_buffer(f: &mut Fixture, client: ClientId, surface: &WlSurface, size: (u16, u16)) {
+    let layer = f.client(client).layer(surface);
+    layer.attach_new_shm_buffer(size.0, size.1);
+    layer.surface.commit();
+    f.double_roundtrip(client);
+}
+
+fn imported_texture_size(f: &mut Fixture, surface: &ServerSurface) -> Option<(i32, i32)> {
+    let context = f
+        .niri_state()
+        .backend
+        .headless()
+        .renderer()
+        .unwrap()
+        .context_id();
+    with_states(surface, |states| {
+        let data = states.data_map.get::<RendererSurfaceStateUserData>()?;
+        data.lock()
+            .unwrap()
+            .texture::<GlesTexture>(context)
+            .map(|texture| texture.size().into())
+    })
+}
+
+/// Construct the scene without drawing it, so imported textures expose work done too early
+/// for DRM's later occlusion pass to avoid it.
+fn scene_element_ids(f: &mut Fixture, target: RenderTarget) -> Vec<Id> {
+    let output = f.niri_output(1);
+    f.niri().update_render_elements(Some(&output));
+    let state = f.niri_state();
+    let renderer = state.backend.headless().renderer().unwrap();
+    let ctx = RenderCtx {
+        renderer,
+        target,
+        xray: None,
+    };
+    state
+        .niri
+        .render_to_vec(ctx, &output, false)
+        .iter()
+        .map(|element| element.id().clone())
+        .collect()
+}
 
 fn change_fullscreen(f: &mut Fixture, id: ClientId, surface: &WlSurface, fullscreen: bool) {
     set_time(f, Duration::ZERO);

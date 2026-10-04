@@ -3003,6 +3003,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        let view_rect = Rectangle::from_size(self.view_size);
+        let can_cull_behind_fullscreen = layer.is_normal()
+            && xray_pos.zoom == 1.
+            && self.render_above_top_layer()
+            && !self.are_animations_ongoing();
         let mut first = true;
 
         // This matches self.tiles_with_render_positions().
@@ -3045,6 +3050,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
                     push(elem.into())
                 });
+                // Importing a Wayland render element may already copy a buffer between GPUs.
+                // Stop before constructing the hidden elements, rather than leaving their
+                // occlusion entirely to the DRM renderer after those imports have happened.
+                if can_cull_behind_fullscreen && tile.opaque_fullscreen_covers(tile_pos, view_rect)
+                {
+                    return;
+                }
             }
         }
     }

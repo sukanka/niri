@@ -4988,20 +4988,71 @@ impl Niri {
             }
         }
 
-        if let Some(gles_ctx) = ctx.as_gles() {
-            self.fill_xray_elements(gles_ctx, output);
-        } else if let Some(vk_ctx) = ctx.as_vulkan() {
-            self.fill_xray_elements(vk_ctx, output);
+        let skip_background = self.can_skip_fullscreen_background(output, ctx.target);
+        if !skip_background {
+            if let Some(gles_ctx) = ctx.as_gles() {
+                self.fill_xray_elements(gles_ctx, output);
+            } else if let Some(vk_ctx) = ctx.as_vulkan() {
+                self.fill_xray_elements(vk_ctx, output);
+            }
         }
 
         // Reborrow to shorten lifetime to be able to put in xray.
         let mut ctx = ctx.r();
         let state = self.output_state.get(output).unwrap();
-        ctx.xray = Some(&state.xray);
+        ctx.xray = (!skip_background).then_some(&state.xray);
 
-        self.render_inner(ctx, output, include_pointer, push);
+        self.render_inner(ctx, output, include_pointer, skip_background, push);
 
         self.clear_xray_elements(output);
+    }
+
+    fn can_skip_fullscreen_background(&self, output: &Output, target: RenderTarget) -> bool {
+        // Captures and previews keep their own scene construction, including block-out rules.
+        // Popups, overlays and switcher previews may deliberately sample the desktop through
+        // xray even when a fullscreen backdrop hides it in the ordinary scene.
+        if target != RenderTarget::Output
+            || self.is_locked()
+            || self.screenshot_ui.is_open()
+            || self.window_mru_ui.is_open()
+            || self.window_mru_ui.are_animations_ongoing()
+            || self.output_state[output].screen_transition.is_some()
+            || self.layout.are_animations_ongoing(Some(output))
+            || self.layout.interactive_move_is_moving_above_output(output)
+            || layer_map_for_output(output)
+                .layers_on(Layer::Overlay)
+                .next()
+                .is_some()
+        {
+            return false;
+        }
+
+        let Some(mon) = self.layout.monitor_for_output(output) else {
+            return false;
+        };
+        if !mon.render_above_top_layer() || mon.overview_zoom() != 1. {
+            return false;
+        }
+
+        let ws = mon.active_workspace_ref();
+        if ws.is_floating_visible() {
+            return false;
+        }
+        let Some(window) = ws.active_window() else {
+            return false;
+        };
+        if PopupManager::popups_for_surface(window.toplevel().wl_surface())
+            .next()
+            .is_some()
+        {
+            return false;
+        }
+
+        ws.tiles_with_render_positions()
+            .find(|(tile, _, visible)| *visible && tile.window().id() == window.id())
+            .is_some_and(|(tile, location, _)| {
+                tile.opaque_fullscreen_covers(location, Rectangle::from_size(output_size(output)))
+            })
     }
 
     fn render_inner<R: NiriRenderer>(
@@ -5009,6 +5060,7 @@ impl Niri {
         mut ctx: RenderCtx<R>,
         output: &Output,
         include_pointer: bool,
+        skip_background: bool,
         push: &mut dyn FnMut(OutputRenderElements<R>),
     ) where
         UniversalTextureRenderElement: RenderElement<R>,
@@ -5191,6 +5243,10 @@ impl Niri {
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+
+            if skip_background {
+                return;
+            }
 
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);

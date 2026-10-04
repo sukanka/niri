@@ -714,6 +714,30 @@ impl<W: LayoutElement> Tile<W> {
         self.sizing_mode
     }
 
+    /// Whether the stable fullscreen backdrop hides everything behind it in `area`.
+    pub fn opaque_fullscreen_covers(
+        &self,
+        location: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+    ) -> bool {
+        if self.fullscreen_progress() != 1.
+            || self.are_animations_ongoing()
+            || self.alpha_animation.is_some()
+            || !self.fullscreen_backdrop.color().is_opaque()
+        {
+            return false;
+        }
+
+        let backdrop = Rectangle::new(
+            location + self.bob_offset(),
+            self.fullscreen_backdrop.size(),
+        );
+        backdrop.contains_rect(area)
+            && backdrop
+                .to_physical_precise_round::<_, i32>(self.scale)
+                .contains_rect(area.to_physical_precise_round(self.scale))
+    }
+
     fn fullscreen_progress(&self) -> f64 {
         if let Some(resize) = &self.resize_animation {
             if let Some(anim) = &resize.fullscreen_progress {
