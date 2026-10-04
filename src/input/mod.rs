@@ -61,6 +61,7 @@ pub mod click_grab;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
+mod pointer_constraints;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
@@ -2531,7 +2532,7 @@ impl State {
 
                 // Constraint does not apply if not within region.
                 if let Some(region) = constraint.region() {
-                    if !region.contains(pos_within_surface.to_i32_round()) {
+                    if !region.contains(pos_within_surface.to_i32_floor()) {
                         return;
                     }
                 }
@@ -2622,6 +2623,16 @@ impl State {
             }
         }
 
+        if let Some((focus_surface, region)) = &pointer_confined {
+            new_pos = pointer_constraints::confine_motion(
+                &focus_surface.0,
+                focus_surface.1,
+                region.as_ref(),
+                pos,
+                new_pos,
+            );
+        }
+
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
             let point = (new_pos - geom.loc.to_f64())
@@ -2642,20 +2653,12 @@ impl State {
         let under = self.niri.contents_under(new_pos);
 
         // Handle confined pointer.
-        if let Some((focus_surface, region)) = pointer_confined {
+        if let Some((focus_surface, _region)) = pointer_confined {
             let mut prevent = false;
 
             // Prevent the pointer from leaving the focused surface.
             if Some(&focus_surface.0) != under.surface.as_ref().map(|(s, _)| s) {
                 prevent = true;
-            }
-
-            // Prevent the pointer from leaving the confine region, if any.
-            if let Some(region) = region {
-                let new_pos_within_surface = new_pos - focus_surface.1;
-                if !region.contains(new_pos_within_surface.to_i32_round()) {
-                    prevent = true;
-                }
             }
 
             if prevent {

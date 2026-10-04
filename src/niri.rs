@@ -7657,7 +7657,7 @@ impl Niri {
             if let Some(region) = constraint.region() {
                 let pointer_pos = pointer.current_location();
                 let pos_within_surface = pointer_pos - *surface_loc;
-                if !region.contains(pos_within_surface.to_i32_round()) {
+                if !region.contains(pos_within_surface.to_i32_floor()) {
                     return;
                 }
             }
