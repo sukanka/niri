@@ -201,11 +201,15 @@ pub trait LayoutElement {
     }
 
     /// Renders the background effect behind the main surface of the element.
+    ///
+    /// `opaque_region` is an opaque backdrop drawn above the effect, in the same coordinates as
+    /// `geometry`. Effects entirely covered by it do not need to be prepared or rendered.
     #[allow(clippy::too_many_arguments)]
     fn render_background_effect<R: NiriRenderer>(
         &self,
         _ctx: RenderCtx<R>,
         _geometry: Rectangle<f64, Logical>,
+        _opaque_region: Option<Rectangle<f64, Logical>>,
         _scale: f64,
         _clip_to_geometry: bool,
         _surface_anim_scale: Scale<f64>,

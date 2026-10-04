@@ -22,7 +22,8 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::ClientId;
 use super::{gpu, Fixture};
 use crate::backend::tty_renderer::TtyOffscreen;
-use crate::render_helpers::background_effect::RenderParams;
+use crate::layout::tile::TileRenderElement;
+use crate::render_helpers::background_effect::{BackgroundEffectElement, RenderParams};
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
@@ -32,6 +33,7 @@ use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shaders::ProgramType;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{blend, shaders, RenderCtx, RenderTarget};
 
 /// Reference and peak luminance of an HDR frame, in cd/m².
@@ -538,9 +540,154 @@ fn scene_xray_layer_surface_draws_gles() {
     assert!(drawn.contains(&"clipped_surface"), "drawn: {drawn:?}");
 }
 
+/// A fullscreen tile puts an opaque backdrop in front of its background effects, even
+/// when the client's buffer is translucent. Check the elements that are constructed:
+/// checking shader draws alone would also pass when damage tracking hides the effects.
+#[test]
+fn scene_fullscreen_background_effects_are_culled_gles() {
+    for xray in [false, true] {
+        for translucent in [false, true] {
+            let mut config = effects_config();
+            config.window_rules[0].background_effect.xray = Some(xray);
+            let Some(mut f) = set_up(config) else {
+                return;
+            };
+            let (id, surface) = add_window(&mut f);
+            if translucent {
+                let window = f.client(id).window(&surface);
+                let buffer =
+                    window
+                        .spbm
+                        .create_u32_rgba_buffer(0, 0, 0, u32::MAX / 2, &window.qh, ());
+                window.surface.attach(Some(&buffer), 0, 0);
+                window.commit();
+                f.double_roundtrip(id);
+            }
+            settle(&mut f);
+            assert_tile_background_effects(&mut f, xray, true);
+
+            change_fullscreen(&mut f, id, &surface, true);
+            settle(&mut f);
+            assert_tile_background_effects(&mut f, xray, false);
+
+            f.niri().layout.toggle_overview();
+            settle(&mut f);
+            assert_tile_background_effects(&mut f, xray, true);
+            f.niri().layout.toggle_overview();
+            settle(&mut f);
+            assert_tile_background_effects(&mut f, xray, false);
+
+            change_fullscreen(&mut f, id, &surface, false);
+            settle(&mut f);
+            assert_tile_background_effects(&mut f, xray, true);
+        }
+    }
+}
+
+/// During the fullscreen transition the backdrop is still translucent, so effects must
+/// survive in both directions until the fully opaque fullscreen state is reached.
+#[test]
+fn scene_fullscreen_transition_keeps_background_effects_gles() {
+    for xray in [false, true] {
+        let mut config = effects_config();
+        config.window_rules[0].background_effect.xray = Some(xray);
+        let Some(mut f) = set_up(config) else {
+            return;
+        };
+        let (id, surface) = add_window(&mut f);
+        settle(&mut f);
+
+        change_fullscreen(&mut f, id, &surface, true);
+        set_time(&mut f, Duration::from_millis(500));
+        assert_tile_background_effects(&mut f, xray, true);
+        settle(&mut f);
+        assert_tile_background_effects(&mut f, xray, false);
+
+        change_fullscreen(&mut f, id, &surface, false);
+        set_time(&mut f, Duration::from_millis(500));
+        assert_tile_background_effects(&mut f, xray, true);
+    }
+}
+
 // =============================================================================
 // Helpers.
 // =============================================================================
+
+fn change_fullscreen(f: &mut Fixture, id: ClientId, surface: &WlSurface, fullscreen: bool) {
+    set_time(f, Duration::ZERO);
+    let window = f.client(id).window(surface);
+    if fullscreen {
+        window.set_fullscreen(None);
+    } else {
+        window.unset_fullscreen();
+    }
+    f.double_roundtrip(id);
+    ack_configured_size(f, id, surface);
+    f.double_roundtrip(id);
+}
+
+fn assert_tile_background_effects(f: &mut Fixture, xray: bool, expected: bool) {
+    for target in [
+        RenderTarget::Output,
+        RenderTarget::Screencast,
+        RenderTarget::ScreenCapture,
+    ] {
+        let output = f.niri_output(1);
+        f.niri().update_render_elements(Some(&output));
+
+        let state = f.niri_state();
+        let renderer = state.backend.headless().renderer().unwrap();
+        let mut ctx = RenderCtx {
+            renderer,
+            target,
+            xray: None,
+        };
+        state.niri.fill_xray_elements(ctx.r(), &output);
+        ctx.xray = Some(&state.niri.output_state[&output].xray);
+
+        let workspace = state.niri.layout.active_workspace().unwrap();
+        let monitor = state.niri.layout.monitor_for_output(&output).unwrap();
+        let (_, workspace_geo) = monitor
+            .workspaces_with_render_geo()
+            .find(|(ws, _)| ws.id() == workspace.id())
+            .unwrap();
+        let xray_pos = XrayPos::new(workspace_geo.loc, monitor.overview_zoom());
+        let (tile, location, _) = workspace.tiles_with_render_positions().next().unwrap();
+        let mut effects = Vec::new();
+        tile.render(
+            ctx,
+            location,
+            xray_pos.offset(location),
+            true,
+            &mut |elem| {
+                if let TileRenderElement::BackgroundEffect(effect) = elem {
+                    effects.push(match effect {
+                        BackgroundEffectElement::FramebufferEffect(_) => "framebuffer",
+                        BackgroundEffectElement::Xray(_) => "xray",
+                        BackgroundEffectElement::ExtraDamage(_) => "damage",
+                    });
+                }
+            },
+        );
+        state.niri.clear_xray_elements(&output);
+
+        if expected {
+            let required = if xray { "xray" } else { "framebuffer" };
+            assert!(
+                effects.contains(&required),
+                "missing {required} background effect for {target:?}: {effects:?}"
+            );
+            if xray {
+                assert!(effects.contains(&"damage"), "effects: {effects:?}");
+            }
+        } else {
+            assert!(
+                effects.is_empty(),
+                "fullscreen backdrop should occlude effects for {target:?}: {effects:?}"
+            );
+        }
+    }
+}
 
 fn size() -> Size<i32, Physical> {
     Size::from((256, 256))

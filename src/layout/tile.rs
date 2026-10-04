@@ -1284,6 +1284,7 @@ impl<W: LayoutElement> Tile<W> {
                 });
         }
 
+        let mut opaque_region = None;
         if fullscreen_progress > 0. {
             let alpha = fullscreen_progress as f32;
 
@@ -1321,6 +1322,9 @@ impl<W: LayoutElement> Tile<W> {
                     alpha,
                     Kind::Unspecified,
                 );
+                if elem.color().is_opaque() {
+                    opaque_region = Some(elem.geo());
+                }
                 push(elem.into());
             }
         }
@@ -1351,6 +1355,7 @@ impl<W: LayoutElement> Tile<W> {
         self.window.render_background_effect(
             ctx.r(),
             area,
+            opaque_region,
             self.scale,
             clip_to_geometry,
             surface_anim_scale,

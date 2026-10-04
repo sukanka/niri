@@ -74,6 +74,15 @@ impl RenderParams {
             *radius = radius.fit_to(geo.size.w as f32, geo.size.h as f32);
         }
     }
+
+    fn is_covered_by(&self, opaque: Rectangle<f64, Logical>) -> bool {
+        // Elements round their position and size separately. Logical containment alone does not
+        // guarantee that the effect stays inside the backdrop after rounding to physical pixels.
+        opaque.contains_rect(self.geometry)
+            && opaque
+                .to_physical_precise_round::<_, i32>(self.scale)
+                .contains_rect(self.geometry.to_physical_precise_round(self.scale))
+    }
 }
 
 niri_render_elements! {
@@ -352,6 +361,7 @@ pub fn render_for_tile<R: NiriRenderer>(
     ctx: RenderCtx<R>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
+    opaque_region: Option<Rectangle<f64, Logical>>,
     scale: f64,
     clip_to_geometry: bool,
     surface: &WlSurface,
@@ -393,7 +403,74 @@ pub fn render_for_tile<R: NiriRenderer>(
             return;
         };
 
+        // Skip before preparing xray's offscreen contents. Client blur regions can extend past
+        // the window geometry, so check the final effect geometry against the opaque backdrop.
+        // Overview scaling introduces another rounding step; keep that path unchanged.
+        if xray_pos.zoom == 1. && opaque_region.is_some_and(|opaque| params.is_covered_by(opaque)) {
+            return;
+        }
+
         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
         background_effect.render(ctx, ns, params, xray_pos, push);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_backdrop_covers_effect_at_fractional_scales() {
+        let geometry = Rectangle::new((10., 20.).into(), (800., 600.).into());
+        for scale in [1., 1.25, 1.5, 2.] {
+            let params = render_params_for_tile(
+                geometry,
+                scale,
+                false,
+                false,
+                None,
+                geometry,
+                Scale::from(1.),
+            )
+            .unwrap();
+            assert!(params.is_covered_by(geometry));
+            assert!(params.is_covered_by(Rectangle::new((0., 0.).into(), (1920., 1080.).into(),)));
+            assert!(!params.is_covered_by(Rectangle::new((11., 20.).into(), (800., 600.).into(),)));
+        }
+    }
+
+    #[test]
+    fn logical_coverage_must_survive_pixel_rounding() {
+        // Both right edges are at 1.5 logically, but position and size round independently:
+        // the backdrop ends at pixel 1 while the effect ends at pixel 2.
+        let opaque = Rectangle::new((0.25, 0.).into(), (1.25, 10.).into());
+        let geometry = Rectangle::new((0.5, 0.).into(), (1., 10.).into());
+        let params =
+            render_params_for_tile(geometry, 1., false, false, None, geometry, Scale::from(1.))
+                .unwrap();
+        assert!(opaque.contains_rect(geometry));
+        assert!(!params.is_covered_by(opaque));
+    }
+
+    #[test]
+    fn client_blur_region_outside_backdrop_is_not_covered() {
+        let geometry = Rectangle::from_size((100., 100.).into());
+        let surface_geo = Rectangle::new((-8., -8.).into(), (116., 116.).into());
+        let blur_region = Arc::new(vec![Rectangle::from_size((116, 116).into())]);
+
+        for block_out in [false, true] {
+            let params = render_params_for_tile(
+                geometry,
+                1.25,
+                false,
+                block_out,
+                Some(blur_region.clone()),
+                surface_geo,
+                Scale::from(1.),
+            )
+            .unwrap();
+            // Blocked-out captures intentionally constrain effects to the window geometry.
+            assert_eq!(params.is_covered_by(geometry), block_out);
+        }
+    }
 }
