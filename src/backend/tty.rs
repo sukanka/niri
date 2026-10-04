@@ -1513,9 +1513,13 @@ impl Tty {
             debug!("couldn't reset gamma: {err:?}");
         }
 
-        let surface = device
-            .drm
-            .create_surface(crtc, mode, &[connector.handle()])?;
+        // A probe must share this surface's lifetime. Dropping an independent
+        // DrmSurface clears the live CRTC even when it only issued TEST_ONLY requests.
+        let surface = Arc::new(
+            device
+                .drm
+                .create_surface(crtc, mode, &[connector.handle()])?,
+        );
 
         // Probe the connector's color/HDR capabilities: HDR signalling needs the Colorspace
         // (with BT2020_RGB) and HDR_OUTPUT_METADATA properties from the driver, plus a sink
@@ -1703,13 +1707,9 @@ impl Tty {
             // Some drivers can render into AR30/AB30 but not XR30/XB30; treating 10-bit as a
             // boolean capability would either pick a broken format or fall back too far to 8-bit.
             for format in HDR_TEN_BIT_COLOR_FORMATS {
-                let surface = device
-                    .drm
-                    .create_surface(crtc, mode, &[connector.handle()])?;
-
                 let mut compositor: GbmDrmCompositor = match DrmCompositor::new(
                     OutputModeSource::Auto(output.downgrade()),
-                    surface,
+                    surface.clone(),
                     None,
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
@@ -1804,7 +1804,7 @@ impl Tty {
         );
         let mut res = DrmCompositor::new(
             OutputModeSource::Auto(output.downgrade()),
-            surface,
+            surface.clone(),
             None,
             device.allocator.clone(),
             GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
@@ -1824,14 +1824,10 @@ impl Tty {
             color_formats = &SDR_COLOR_FORMATS;
             using_10bit_formats = false;
 
-            // DrmCompositor::new() consumed the surface...
-            let surface = device
-                .drm
-                .create_surface(crtc, mode, &[connector.handle()])?;
-
+            // Keep the same surface alive across failed format attempts.
             res = DrmCompositor::new(
                 OutputModeSource::Auto(output.downgrade()),
-                surface,
+                surface.clone(),
                 None,
                 device.allocator.clone(),
                 GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
@@ -1853,14 +1849,10 @@ impl Tty {
                     .filter(|format| format.modifier == Modifier::Invalid)
                     .collect::<FormatSet>();
 
-                // DrmCompositor::new() consumed the surface...
-                let surface = device
-                    .drm
-                    .create_surface(crtc, mode, &[connector.handle()])?;
-
+                // Keep the same surface alive across failed format attempts.
                 DrmCompositor::new(
                     OutputModeSource::Auto(output.downgrade()),
-                    surface,
+                    surface.clone(),
                     None,
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
@@ -1916,16 +1908,12 @@ impl Tty {
 
             if !trial_ok {
                 color_formats = &SDR_COLOR_FORMATS;
-                // Drop the 10-bit compositor first so its surface releases the CRTC before we
-                // create a fresh 8-bit surface for it. (The trial only rendered; it never queued
-                // or committed, so the CRTC was not modeset.)
+                // Discard probe buffers while the shared surface keeps the current
+                // CRTC state intact. No real commit has been queued by this probe.
                 drop(compositor);
-                let surface = device
-                    .drm
-                    .create_surface(crtc, mode, &[connector.handle()])?;
                 compositor = DrmCompositor::new(
                     OutputModeSource::Auto(output.downgrade()),
-                    surface,
+                    surface.clone(),
                     None,
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
