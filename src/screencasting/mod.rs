@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use calloop::LoopHandle;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::Bind;
@@ -25,7 +26,9 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
-use pw_utils::{test_implicit_buffer, Cast, CastGbm, CastSizeChange, CursorData, PipeWire, PwToNiri};
+use pw_utils::{
+    test_implicit_buffer, Cast, CastDevice, CastGbm, CastSizeChange, CursorData, PipeWire, PwToNiri,
+};
 
 use crate::layout::LayoutElementRenderElement;
 use crate::render_helpers::texture::UniversalTextureRenderElement;
@@ -88,7 +91,7 @@ impl State {
         target: &CastTarget,
         dynamic_target: bool,
         size: Size<i32, Physical>,
-    ) -> anyhow::Result<Option<CastGbm>> {
+    ) -> anyhow::Result<CastDevice> {
         // Ensure PipeWire is initialized.
         if self.niri.casting.pipewire.is_none() {
             let pw = PipeWire::new(
@@ -99,26 +102,18 @@ impl State {
             self.niri.casting.pipewire = Some(pw);
         }
 
-        if self.niri.config.borrow().debug.disable_pipewire_dmabuf {
-            return Ok(None);
-        }
-
-        // A window or dynamic target can move to another GPU while the stream
-        // keeps its allocated buffers. Use shared memory in this case until
-        // PipeWire streams can renegotiate the allocator when their GPU changes.
-        if self.backend.render_on_output_device()
-            && (dynamic_target || !matches!(target, CastTarget::Output { .. }))
+        let output = self.cast_target_output(target);
+        let node = self.cast_target_node(output.as_ref());
+        let shm = CastDevice { node, gbm: None };
+        if self.niri.config.borrow().debug.disable_pipewire_dmabuf
+            || matches!(target, CastTarget::Nothing)
         {
-            return Ok(None);
+            return Ok(shm);
         }
 
-        let output = match target {
-            CastTarget::Output { output, .. } => output.upgrade(),
-            _ => None,
-        };
         let Some(mut gbm) = self.backend.gbm_device_for_output(output.as_ref()) else {
             // We will offer shm only.
-            return Ok(None);
+            return Ok(shm);
         };
 
         let mut render_formats =
@@ -141,6 +136,13 @@ impl State {
                         .context("output screencast renderer is unavailable")?;
 
                     if let Err(err) = implicit_test {
+                        if dynamic_target || matches!(target, CastTarget::Window { .. }) {
+                            debug!(
+                                output = output.name(),
+                                "local screencast DMA unavailable, using SHM: {err:?}"
+                            );
+                            return Ok(shm);
+                        }
                         warn!(
                             output = output.name(),
                             "output GPU cannot render to an implicit screencast buffer; trying primary GPU: {err:?}"
@@ -182,17 +184,94 @@ impl State {
             }
         }
 
-        Ok(Some(CastGbm {
-            device: gbm,
-            formats: render_formats,
-            render_on_primary,
-        }))
+        Ok(CastDevice {
+            node,
+            gbm: Some(CastGbm {
+                device: gbm,
+                formats: render_formats,
+                render_on_primary,
+            }),
+        })
+    }
+
+    fn cast_target_output(&self, target: &CastTarget) -> Option<Output> {
+        match target {
+            CastTarget::Nothing => None,
+            CastTarget::Output { output, .. } => output.upgrade(),
+            CastTarget::Window { id } => self.niri.layout.windows().find_map(|(output, mapped)| {
+                (mapped.id().get() == *id)
+                    .then(|| {
+                        output.map(|monitor| monitor.output().clone()).or_else(|| {
+                            self.niri
+                                .casting
+                                .mapped_cast_output
+                                .get(&mapped.window)
+                                .cloned()
+                        })
+                    })
+                    .flatten()
+            }),
+        }
+    }
+
+    fn cast_target_node(&mut self, output: Option<&Output>) -> Option<DrmNode> {
+        match output {
+            Some(output) => self.backend.render_node_for_output(output),
+            None => self.backend.primary_render_node(),
+        }
+    }
+
+    /// Run before refreshing cast rates or rendering screencasts on their current GPUs.
+    pub fn refresh_cast_devices(&mut self) {
+        let mut casts = mem::take(&mut self.niri.casting.casts);
+        let mut to_stop = HashSet::new();
+        for cast in &mut casts {
+            let output = self.cast_target_output(&cast.target);
+            let node = self.cast_target_node(output.as_ref());
+            let res = if node != cast.device_node {
+                match self.prepare_pw_cast(&cast.target, cast.dynamic_target, cast.size()) {
+                    Ok(device) => cast.set_device(device),
+                    Err(err) => {
+                        warn!("error preparing new screencast GPU, using SHM: {err:?}");
+                        cast.set_device(CastDevice { node, gbm: None })
+                    }
+                }
+            } else {
+                cast.progress_device_change()
+            };
+            if let Err(err) = res {
+                warn!("error changing screencast GPU: {err:?}");
+                to_stop.insert(cast.session_id);
+            }
+        }
+        self.niri.casting.casts = casts;
+        for session_id in to_stop {
+            self.niri.stop_cast(session_id);
+        }
     }
 
     pub fn on_pw_msg(&mut self, msg: PwToNiri) {
         match msg {
             PwToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
             PwToNiri::Redraw { stream_id } => self.redraw_cast(stream_id),
+            PwToNiri::FallbackToShm { stream_id } => {
+                let mut to_stop = None;
+                if let Some(cast) = self
+                    .niri
+                    .casting
+                    .casts
+                    .iter_mut()
+                    .find(|cast| cast.stream_id == stream_id)
+                {
+                    if let Err(err) = cast.fallback_to_shm() {
+                        warn!("error falling back to SHM screencast: {err:?}");
+                        to_stop = Some(cast.session_id);
+                    }
+                }
+                if let Some(session_id) = to_stop {
+                    self.niri.stop_cast(session_id);
+                }
+            }
             PwToNiri::FatalError => {
                 warn!("stopping PipeWire due to fatal error");
                 let casting = &mut self.niri.casting;
@@ -215,6 +294,7 @@ impl State {
 
     fn redraw_cast(&mut self, stream_id: CastStreamId) {
         let _span = tracy_client::span!("State::redraw_cast");
+        self.refresh_cast_devices();
 
         let casts = &mut self.niri.casting.casts;
         let Some(idx) = casts.iter().position(|cast| cast.stream_id == stream_id) else {
@@ -222,6 +302,9 @@ impl State {
             return;
         };
         let cast = &mut casts[idx];
+        if !cast.is_active() {
+            return;
+        }
 
         let id = match &cast.target {
             CastTarget::Nothing => {
@@ -249,13 +332,17 @@ impl State {
         #[allow(clippy::never_loop)]
         loop {
             let mut windows = self.niri.layout.windows();
-            let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == id) else {
+            let Some((monitor, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == id)
+            else {
                 break;
             };
 
-            // Use the cached output since it will be present even if the output was
-            // currently disconnected.
-            let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) else {
+            // Use the current output so the renderer matches the allocator, keeping the cached
+            // output as a fallback for a window whose output was disconnected.
+            let Some(output) = monitor
+                .map(|monitor| monitor.output())
+                .or_else(|| self.niri.casting.mapped_cast_output.get(&mapped.window))
+            else {
                 break;
             };
 
@@ -355,6 +442,14 @@ impl State {
             }
         }
 
+        for cast in &mut self.niri.casting.casts {
+            if cast.dynamic_target {
+                cast.target = target.clone();
+            }
+        }
+        // Detect the GPU change before set_refresh() can renegotiate buffers on the old GPU.
+        self.refresh_cast_devices();
+
         let mut to_redraw = Vec::new();
         let mut to_stop = Vec::new();
         for cast in &mut self.niri.casting.casts {
@@ -370,10 +465,12 @@ impl State {
                 }
             }
 
-            cast.target = target.clone();
             to_redraw.push(cast.stream_id);
         }
 
+        for session_id in to_stop {
+            self.niri.stop_cast(session_id);
+        }
         for id in to_redraw {
             self.redraw_cast(id);
         }

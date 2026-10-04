@@ -192,8 +192,9 @@ The option controls niri's compositor, not which GPU an application uses.
 For integrated-GPU desktop applications and discrete-GPU games, keep the integrated GPU as the primary GPU (or select it with [`render-drm-device`](#render-drm-device)) and launch games with the appropriate GPU selection settings.
 Moving a window to an output on another GPU does not force the application to switch GPUs, so cross-GPU copies may still be necessary for that window.
 Screen capture and other offscreen rendering may also require cross-GPU transfers.
-When this option is enabled, PipeWire window captures and dynamic-target screencasts use shared-memory buffers, so that moving their target between GPUs does not leave DMA-BUF buffers tied to the previous GPU.
-Fixed-output screencasts can still use DMA-BUF buffers allocated on that output's GPU.
+PipeWire captures can use DMA-BUF buffers allocated on their target output's GPU, including window captures and dynamic targets.
+When a target moves to another GPU, niri waits for outstanding writes, retires the old DMA-BUF buffers through a shared-memory negotiation, and offers buffers from the new GPU.
+Shared-memory capture remains available when local DMA-BUF allocation or import is unsupported, or the consumer prefers it.
 
 ```kdl
 debug {

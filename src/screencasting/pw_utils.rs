@@ -36,6 +36,7 @@ use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmBuffer, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
@@ -87,6 +88,92 @@ pub struct CastGbm {
     pub render_on_primary: bool,
 }
 
+#[derive(Clone)]
+pub struct CastDevice {
+    /// The GPU of the target, including when allocation falls back to SHM or the primary GPU.
+    pub node: Option<DrmNode>,
+    pub gbm: Option<CastGbm>,
+}
+
+#[derive(Default)]
+struct CastAllocator {
+    gbm: Option<GbmDevice<DeviceFd>>,
+    formats: FormatSet,
+}
+
+impl From<Option<CastGbm>> for CastAllocator {
+    fn from(gbm: Option<CastGbm>) -> Self {
+        gbm.map(|gbm| Self {
+            gbm: Some(gbm.device),
+            formats: gbm.formats,
+        })
+        .unwrap_or_default()
+    }
+}
+
+enum DeviceChange {
+    /// Do not retire buffers while their old GPU is still writing them.
+    WaitingForFrames(CastDevice),
+    /// Force a different memory type even if both GPUs offer identical formats/modifiers.
+    WaitingForShm(CastDevice),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceChangeStep {
+    Wait,
+    NegotiateShm,
+    Install,
+}
+
+impl DeviceChange {
+    fn next_step(
+        &self,
+        pending_frames: usize,
+        allocated_dmabufs: usize,
+        has_dma_allocator: bool,
+        state: &CastState,
+    ) -> DeviceChangeStep {
+        match self {
+            Self::WaitingForFrames(_) if pending_frames != 0 => DeviceChangeStep::Wait,
+            Self::WaitingForFrames(_)
+                if allocated_dmabufs != 0
+                    || (has_dma_allocator
+                        && !matches!(
+                            state,
+                            CastState::Ready {
+                                dma_negotiation: None,
+                                ..
+                            }
+                        )) =>
+            {
+                DeviceChangeStep::NegotiateShm
+            }
+            Self::WaitingForFrames(_) => DeviceChangeStep::Install,
+            Self::WaitingForShm(_) => {
+                if allocated_dmabufs == 0
+                    && matches!(
+                        state,
+                        CastState::Ready {
+                            dma_negotiation: None,
+                            ..
+                        }
+                    )
+                {
+                    DeviceChangeStep::Install
+                } else {
+                    DeviceChangeStep::Wait
+                }
+            }
+        }
+    }
+
+    fn into_device(self) -> CastDevice {
+        match self {
+            Self::WaitingForFrames(device) | Self::WaitingForShm(device) => device,
+        }
+    }
+}
+
 pub struct PipeWire {
     _context: ContextRc,
     pub core: CoreRc,
@@ -98,6 +185,7 @@ pub struct PipeWire {
 pub enum PwToNiri {
     StopCast { session_id: CastSessionId },
     Redraw { stream_id: CastStreamId },
+    FallbackToShm { stream_id: CastStreamId },
     FatalError,
 }
 
@@ -111,7 +199,10 @@ pub struct Cast {
     pub target: CastTarget,
     pub dynamic_target: bool,
     pub render_on_primary: bool,
-    formats: FormatSet,
+    allocator: Rc<RefCell<CastAllocator>>,
+    pub device_node: Option<DrmNode>,
+    device_change: Option<DeviceChange>,
+    changing_device: Rc<Cell<bool>>,
     offer_alpha: bool,
     cursor_mode: CursorMode,
     last_frame_time: Duration,
@@ -121,6 +212,7 @@ pub struct Cast {
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
     waiting_for_buffer: Rc<Cell<bool>>,
+    to_niri: calloop::channel::Sender<PwToNiri>,
 }
 
 /// Mutable `Cast` state shared with PipeWire callbacks.
@@ -441,7 +533,7 @@ impl PipeWire {
     #[allow(clippy::too_many_arguments)]
     pub fn start_cast(
         &self,
-        gbm: Option<CastGbm>,
+        device: CastDevice,
         session_id: CastSessionId,
         stream_id: CastStreamId,
         target: CastTarget,
@@ -466,9 +558,17 @@ impl PipeWire {
                 warn!("error sending Redraw to niri: {err:?}");
             }
         };
+        let to_niri_ = self.to_niri.clone();
+        let fallback_to_shm = move || {
+            if let Err(err) = to_niri_.send(PwToNiri::FallbackToShm { stream_id }) {
+                warn!("error sending FallbackToShm to niri: {err:?}");
+            }
+        };
         let redraw_ = redraw.clone();
         let redraw_process = redraw.clone();
+        let redraw_remove = redraw.clone();
         let waiting_for_buffer = Rc::new(Cell::new(false));
+        let changing_device = Rc::new(Cell::new(false));
 
         let stream = StreamRc::new(
             self.core.clone(),
@@ -487,12 +587,8 @@ impl PipeWire {
 
         let pending_size = Size::from((size.w as u32, size.h as u32));
 
-        let (gbm, formats, render_on_primary) = if let Some(gbm) = gbm {
-            (Some(gbm.device), gbm.formats, gbm.render_on_primary)
-        } else {
-            debug!("no gbm device; advertising only shm formats");
-            (None, FormatSet::default(), false)
-        };
+        let render_on_primary = device.gbm.as_ref().is_some_and(|gbm| gbm.render_on_primary);
+        let allocator = Rc::new(RefCell::new(CastAllocator::from(device.gbm)));
 
         // Like in good old wayland-rs times...
         let inner = Rc::new(RefCell::new(CastInner {
@@ -568,8 +664,8 @@ impl PipeWire {
             .param_changed({
                 let inner = inner.clone();
                 let stop_cast = stop_cast.clone();
-                let gbm = gbm.clone();
-                let formats = formats.clone();
+                let allocator = allocator.clone();
+                let fallback_to_shm = fallback_to_shm.clone();
                 move |stream, (), id, pod| {
                     let id = ParamType::from_raw(id);
                     trace!(%stream_id, ?id, "param_changed");
@@ -647,6 +743,16 @@ impl PipeWire {
                     let prop_modifier =
                         object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
 
+                    let allocator = allocator.borrow();
+                    let gbm = &allocator.gbm;
+                    let formats = &allocator.formats;
+                    // A late reply to the previous DMA offer must not revive the old allocator
+                    // while a GPU migration is negotiating SHM.
+                    if prop_modifier.is_some() && gbm.is_none() {
+                        trace!("ignoring stale DMA format during SHM negotiation");
+                        return;
+                    }
+
                     match prop_modifier {
                         Some(prop_modifier)
                             if prop_modifier.flags().contains(PodPropFlags::DONT_FIXATE) =>
@@ -677,8 +783,8 @@ impl PipeWire {
                             ) {
                                 Ok(x) => x,
                                 Err(err) => {
-                                    warn!("couldn't find preferred modifier: {err:?}");
-                                    stop_cast();
+                                    warn!("couldn't find preferred modifier, trying SHM: {err:?}");
+                                    fallback_to_shm();
                                     return;
                                 }
                             };
@@ -789,8 +895,8 @@ impl PipeWire {
                                 ) {
                                     Ok(x) => x,
                                     Err(err) => {
-                                        warn!("test allocation failed: {err:?}");
-                                        stop_cast();
+                                        warn!("test allocation failed, trying SHM: {err:?}");
+                                        fallback_to_shm();
                                         return;
                                     }
                                 };
@@ -928,11 +1034,18 @@ impl PipeWire {
             })
             .add_buffer({
                 let inner = inner.clone();
+                let allocator = allocator.clone();
                 let stop_cast = stop_cast.clone();
+                let fallback_to_shm = fallback_to_shm.clone();
                 move |stream, (), buffer| {
                     let _span = debug_span!("add_buffer", %stream_id).entered();
 
-                    match unsafe { inner.borrow_mut().on_add_buffer(gbm.as_ref(), buffer) } {
+                    let allocator = allocator.borrow();
+                    match unsafe {
+                        inner
+                            .borrow_mut()
+                            .on_add_buffer(allocator.gbm.as_ref(), buffer)
+                    } {
                         Ok(redraw) => {
                             // During size re-negotiation, the stream sometimes just keeps
                             // running, in which case we may need to force a redraw once we got
@@ -943,18 +1056,29 @@ impl PipeWire {
                         }
                         Err(err) => {
                             warn!("error adding pw buffer: {err:?}");
-                            stop_cast();
+                            if allocator.gbm.is_some() {
+                                fallback_to_shm();
+                            } else {
+                                stop_cast();
+                            }
                         }
                     };
                 }
             })
             .remove_buffer({
                 let inner = inner.clone();
+                let changing_device = changing_device.clone();
                 move |_stream, (), buffer| {
                     let _span = debug_span!("remove_buffer", %stream_id).entered();
 
-                    unsafe {
-                        inner.borrow_mut().on_remove_buffer(buffer);
+                    let last_dma_removed = unsafe {
+                        let mut inner = inner.borrow_mut();
+                        let had_dma = !inner.dmabufs.is_empty();
+                        inner.on_remove_buffer(buffer);
+                        had_dma && inner.dmabufs.is_empty()
+                    };
+                    if last_dma_removed && changing_device.get() {
+                        redraw_remove();
                     }
                 }
             })
@@ -963,7 +1087,13 @@ impl PipeWire {
 
         trace!("starting pw stream with size={pending_size:?}, refresh={refresh:?}");
 
-        make_params!(params, &formats, pending_size, refresh, alpha);
+        make_params!(
+            params,
+            &allocator.borrow().formats,
+            pending_size,
+            refresh,
+            alpha
+        );
         stream
             .connect(
                 Direction::Output,
@@ -982,7 +1112,10 @@ impl PipeWire {
             target,
             dynamic_target: false,
             render_on_primary,
-            formats,
+            allocator,
+            device_node: device.node,
+            device_change: None,
+            changing_device,
             offer_alpha: alpha,
             cursor_mode,
             last_frame_time: Duration::ZERO,
@@ -991,6 +1124,7 @@ impl PipeWire {
             sequence_counter: 0,
             inner,
             waiting_for_buffer,
+            to_niri: self.to_niri.clone(),
         };
         Ok(cast)
     }
@@ -998,7 +1132,88 @@ impl PipeWire {
 
 impl Cast {
     pub fn is_active(&self) -> bool {
-        self.inner.borrow().is_active
+        self.device_change.is_none() && self.inner.borrow().is_active
+    }
+
+    pub fn size(&self) -> Size<i32, Physical> {
+        let size = self.inner.borrow().state.expected_format_size();
+        Size::from((size.w as i32, size.h as i32))
+    }
+
+    pub fn set_device(&mut self, device: CastDevice) -> anyhow::Result<()> {
+        self.device_node = device.node;
+        self.device_change = Some(DeviceChange::WaitingForFrames(device));
+        self.changing_device.set(true);
+        self.progress_device_change()
+    }
+
+    pub fn fallback_to_shm(&mut self) -> anyhow::Result<()> {
+        // Several add_buffer callbacks can report the same allocation failure.
+        if self.allocator.borrow().gbm.is_none() && self.device_change.is_none() {
+            return Ok(());
+        }
+        self.set_device(CastDevice {
+            node: self.device_node,
+            gbm: None,
+        })
+    }
+
+    /// Retire the old GPU's buffers through SHM before advertising the new allocator.
+    pub fn progress_device_change(&mut self) -> anyhow::Result<()> {
+        let Some(change) = self.device_change.take() else {
+            return Ok(());
+        };
+        self.queue_completed_buffers();
+        let inner = self.inner.borrow();
+        let step = change.next_step(
+            inner.rendering_buffers.len(),
+            inner.dmabufs.len(),
+            self.allocator.borrow().gbm.is_some(),
+            &inner.state,
+        );
+        drop(inner);
+        match step {
+            DeviceChangeStep::Wait => {
+                self.device_change = Some(change);
+                return Ok(());
+            }
+            DeviceChangeStep::NegotiateShm => {
+                *self.allocator.borrow_mut() = CastAllocator::default();
+                self.device_change = Some(DeviceChange::WaitingForShm(change.into_device()));
+                return self.renegotiate_device(true);
+            }
+            DeviceChangeStep::Install => (),
+        }
+        let device = change.into_device();
+        self.changing_device.set(false);
+        self.render_on_primary = device.gbm.as_ref().is_some_and(|gbm| gbm.render_on_primary);
+        *self.allocator.borrow_mut() = CastAllocator::from(device.gbm);
+        self.renegotiate_device(false)
+    }
+
+    fn renegotiate_device(&mut self, retire_dma: bool) -> anyhow::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        let size = inner.state.expected_format_size();
+        if retire_dma {
+            inner.state = CastState::ResizePending { pending_size: size };
+        } else {
+            // The consumer may keep the same SHM format after receiving the new DMA offer.
+            // Keep it usable even if PipeWire does not emit another format-changed event.
+            inner.state.reset_damage();
+        }
+        let refresh = inner.refresh;
+        drop(inner);
+        self.waiting_for_buffer.set(false);
+        make_params!(
+            params,
+            &self.allocator.borrow().formats,
+            size,
+            refresh,
+            self.offer_alpha
+        );
+        self.stream
+            .update_params(&mut params)
+            .context("error renegotiating screencast GPU")
     }
 
     pub fn node_id(&self) -> Option<u32> {
@@ -1006,6 +1221,9 @@ impl Cast {
     }
 
     pub fn ensure_size(&self, size: Size<i32, Physical>) -> anyhow::Result<CastSizeChange> {
+        if self.device_change.is_some() {
+            return Ok(CastSizeChange::Pending);
+        }
         let mut inner = self.inner.borrow_mut();
 
         let new_size = Size::from((size.w as u32, size.h as u32));
@@ -1029,7 +1247,7 @@ impl Cast {
 
         make_params!(
             params,
-            &self.formats,
+            &self.allocator.borrow().formats,
             new_size,
             inner.refresh,
             self.offer_alpha
@@ -1051,9 +1269,18 @@ impl Cast {
         let _span = tracy_client::span!("Cast::set_refresh");
         debug!("cast FPS changed, updating stream FPS");
         inner.refresh = refresh;
+        if self.device_change.is_some() {
+            return Ok(());
+        }
 
         let size = inner.state.expected_format_size();
-        make_params!(params, &self.formats, size, refresh, self.offer_alpha);
+        make_params!(
+            params,
+            &self.allocator.borrow().formats,
+            size,
+            refresh,
+            self.offer_alpha
+        );
         self.stream
             .update_params(&mut params)
             .context("error updating stream params")?;
@@ -1194,6 +1421,14 @@ impl Cast {
                 pw_stream_queue_buffer(self.stream.as_raw_ptr(), buffer.as_ptr());
             }
         }
+        if first_in_progress_idx != 0
+            && inner.rendering_buffers.is_empty()
+            && self.changing_device.get()
+        {
+            let _ = self.to_niri.send(PwToNiri::Redraw {
+                stream_id: self.stream_id,
+            });
+        }
     }
 
     unsafe fn queue_after_sync(&mut self, pw_buffer: NonNull<pw_buffer>, sync_point: SyncPoint) {
@@ -1201,34 +1436,46 @@ impl Cast {
 
         let mut inner = self.inner.borrow_mut();
 
-        let mut sync_point = sync_point;
-        let sync_fd = match sync_point.export() {
-            Some(sync_fd) => Some(sync_fd),
-            None => {
-                // There are two main ways this can happen. First is that the SyncPoint is
-                // pre-signalled, then the buffer is already ready and no waiting is needed. Second
-                // is that the SyncPoint is potentially still not signalled, but exporting a fence
-                // fd had failed. In this case, there's not much we can do (perhaps do a blocking
-                // wait for the SyncPoint, which itself might fail).
-                //
-                // So let's hope for the best and mark the buffer as submittable. We do not reuse
-                // the original SyncPoint because if we do hit the second case (when it's not
-                // signalled), then without a sync fd we cannot schedule a queue upon its
-                // completion, effectively going stuck. It's better to queue an incomplete buffer
-                // than getting stuck.
-                sync_point = SyncPoint::signaled();
-                None
-            }
-        };
+        let sync_fd = sync_point.export();
+        // Export can fail while the GPU is still writing. Preserve that dependency; in
+        // particular, a device migration must never mistake it for a completed buffer.
+        let needs_poll = sync_fd.is_none() && !sync_point.is_reached();
 
         inner.rendering_buffers.push((pw_buffer, sync_point));
         drop(inner);
 
         match sync_fd {
             None => {
-                trace!("sync_fd is None, queueing completed buffers");
-                // In case this is the only buffer in the list, we will queue it right away.
                 self.queue_completed_buffers();
+                if needs_poll {
+                    let stream_id = self.stream_id;
+                    let delay = Duration::from_millis(1);
+                    self.event_loop
+                        .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                            let Some(cast) = state
+                                .niri
+                                .casting
+                                .casts
+                                .iter_mut()
+                                .find(|cast| cast.stream_id == stream_id)
+                            else {
+                                return TimeoutAction::Drop;
+                            };
+                            cast.queue_completed_buffers();
+                            if cast
+                                .inner
+                                .borrow()
+                                .rendering_buffers
+                                .iter()
+                                .any(|(buffer, _)| *buffer == pw_buffer)
+                            {
+                                TimeoutAction::ToDuration(delay)
+                            } else {
+                                TimeoutAction::Drop
+                            }
+                        })
+                        .unwrap();
+                }
             }
             Some(sync_fd) => {
                 trace!("scheduling buffer to queue");
@@ -1412,6 +1659,11 @@ impl Cast {
                 }
                 Err(err) => {
                     warn!("error rendering to buffer: {err:?}");
+                    if (*(*spa_buffer).datas).type_ == DataType::DmaBuf.as_raw() {
+                        let _ = self.to_niri.send(PwToNiri::FallbackToShm {
+                            stream_id: self.stream_id,
+                        });
+                    }
                     return_unused_buffer(&self.stream, pw_buffer);
                     false
                 }
@@ -1425,18 +1677,11 @@ impl Cast {
     {
         let mut inner = self.inner.borrow_mut();
 
-        // Clear out the damage tracker if we're in Ready state.
-        if let CastState::Ready {
-            damage_tracker,
-            cursor_damage_tracker,
-            pending_frame,
-            ..
-        } = &mut inner.state
-        {
-            *damage_tracker = None;
-            *cursor_damage_tracker = None;
-            *pending_frame = PendingFrame::default();
-        };
+        if self.device_change.is_some() || !matches!(inner.state, CastState::Ready { .. }) {
+            return false;
+        }
+
+        inner.state.reset_damage();
         drop(inner);
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
@@ -1479,6 +1724,11 @@ impl Cast {
                 }
                 Err(err) => {
                     warn!("error clearing buffer: {err:?}");
+                    if (*(*spa_buffer).datas).type_ == DataType::DmaBuf.as_raw() {
+                        let _ = self.to_niri.send(PwToNiri::FallbackToShm {
+                            stream_id: self.stream_id,
+                        });
+                    }
                     return_unused_buffer(&self.stream, pw_buffer);
                     false
                 }
@@ -1625,6 +1875,20 @@ impl CastInner {
 }
 
 impl CastState {
+    fn reset_damage(&mut self) {
+        if let Self::Ready {
+            damage_tracker,
+            cursor_damage_tracker,
+            pending_frame,
+            ..
+        } = self
+        {
+            *damage_tracker = None;
+            *cursor_damage_tracker = None;
+            *pending_frame = PendingFrame::default();
+        }
+    }
+
     fn pending_size(&self) -> Option<Size<u32, Physical>> {
         match self {
             CastState::ResizePending { pending_size } => Some(*pending_size),
@@ -2074,6 +2338,104 @@ fn clear_shmbuf(buffer: &Shmbuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ready_state(dma: bool) -> CastState {
+        CastState::Ready {
+            size: Size::from((3840, 2160)),
+            alpha: true,
+            dma_negotiation: dma.then_some(DmaNegotiation {
+                modifier: Modifier::Invalid,
+                plane_count: 1,
+            }),
+            damage_tracker: None,
+            cursor_damage_tracker: None,
+            pending_frame: PendingFrame::default(),
+        }
+    }
+
+    #[test]
+    fn device_migration_waits_for_old_gpu_and_buffer_retirement() {
+        let device = CastDevice {
+            node: None,
+            gbm: None,
+        };
+        let mut change = DeviceChange::WaitingForFrames(device);
+        let dma = ready_state(true);
+        // A consumer has not returned the buffers yet, and the GPU still writes one frame.
+        assert_eq!(change.next_step(1, 8, true, &dma), DeviceChangeStep::Wait);
+        assert_eq!(
+            change.next_step(0, 8, true, &dma),
+            DeviceChangeStep::NegotiateShm
+        );
+        change = DeviceChange::WaitingForShm(change.into_device());
+        // Matching dimensions and modifier never suffice to reuse the old GPU's buffers.
+        assert_eq!(change.next_step(0, 8, false, &dma), DeviceChangeStep::Wait);
+        let shm = ready_state(false);
+        assert_eq!(change.next_step(0, 1, false, &shm), DeviceChangeStep::Wait);
+        assert_eq!(
+            change.next_step(0, 0, false, &shm),
+            DeviceChangeStep::Install
+        );
+    }
+
+    #[test]
+    fn device_migration_requires_shm_confirmation_even_without_old_buffers() {
+        let change = DeviceChange::WaitingForShm(CastDevice {
+            node: None,
+            gbm: None,
+        });
+        let pending = CastState::ResizePending {
+            pending_size: Size::from((3840, 2160)),
+        };
+        assert_eq!(
+            change.next_step(0, 0, false, &pending),
+            DeviceChangeStep::Wait
+        );
+        assert_eq!(
+            change.next_step(0, 0, false, &ready_state(true)),
+            DeviceChangeStep::Wait
+        );
+        assert_eq!(
+            change.next_step(0, 0, false, &ready_state(false)),
+            DeviceChangeStep::Install
+        );
+    }
+
+    #[test]
+    fn device_migration_from_shm_still_drains_in_flight_frames() {
+        let change = DeviceChange::WaitingForFrames(CastDevice {
+            node: None,
+            gbm: None,
+        });
+        let shm = ready_state(false);
+        assert_eq!(change.next_step(1, 0, false, &shm), DeviceChangeStep::Wait);
+        assert_eq!(
+            change.next_step(0, 0, false, &shm),
+            DeviceChangeStep::Install
+        );
+    }
+
+    #[test]
+    fn device_migration_can_reuse_shm_when_consumer_rejects_dma() {
+        let change = DeviceChange::WaitingForFrames(CastDevice {
+            node: None,
+            gbm: None,
+        });
+        let mut state = ready_state(false);
+        // An allocator can be available even though the consumer negotiated SHM.
+        assert_eq!(
+            change.next_step(0, 0, true, &state),
+            DeviceChangeStep::Install
+        );
+        state.reset_damage();
+        assert!(matches!(
+            state,
+            CastState::Ready {
+                dma_negotiation: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn backpressure_preserves_final_content_and_cursor_bitmap() {
