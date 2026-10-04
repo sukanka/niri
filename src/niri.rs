@@ -507,6 +507,8 @@ pub struct OutputState {
     pub frame_clock: FrameClock,
     pub redraw_state: RedrawState,
     pub on_demand_vrr_enabled: bool,
+    /// One-shot retry for a cursor-only update suppressed while a VRR client was active.
+    pub cursor_update_timer: Option<RegistrationToken>,
     // After the last redraw, some ongoing animations still remain.
     pub unfinished_animations_remain: bool,
     /// Last sequence received in a vblank event.
@@ -3591,6 +3593,7 @@ impl Niri {
             global,
             redraw_state: RedrawState::Idle,
             on_demand_vrr_enabled: false,
+            cursor_update_timer: None,
             unfinished_animations_remain: false,
             frame_clock: FrameClock::new(refresh_interval, vrr),
             last_drm_sequence: None,
@@ -3637,6 +3640,10 @@ impl Niri {
         self.gamma_control_manager_state.output_removed(output);
 
         let state = self.output_state.remove(output).unwrap();
+
+        if let Some(token) = state.cursor_update_timer {
+            self.event_loop.remove(token);
+        }
 
         match state.redraw_state {
             RedrawState::Idle => (),

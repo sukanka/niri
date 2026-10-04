@@ -49,6 +49,16 @@ impl FrameClock {
         self.vrr
     }
 
+    /// Cursor-only updates may wait briefly for client content, but must still
+    /// reach the display if the client becomes idle after the last pointer move.
+    pub fn cursor_update_deadline(&self, now: Duration) -> Option<Duration> {
+        if !self.vrr {
+            return None;
+        }
+        let deadline = self.last_presentation_time? + Duration::from_millis(50);
+        (now < deadline).then_some(deadline)
+    }
+
     pub fn presented(&mut self, presentation_time: Duration) {
         if presentation_time.is_zero() {
             // Not interested in these.
@@ -124,6 +134,34 @@ impl FrameClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_suppression_expires_without_further_client_frames() {
+        let mut clock = FrameClock::new(Some(Duration::from_millis(4)), true);
+        assert_eq!(
+            clock.cursor_update_deadline(Duration::from_millis(100)),
+            None
+        );
+        clock.presented(Duration::from_millis(100));
+        assert_eq!(
+            clock.cursor_update_deadline(Duration::from_millis(120)),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(
+            clock.cursor_update_deadline(Duration::from_millis(150)),
+            None
+        );
+        assert_eq!(
+            clock.cursor_update_deadline(Duration::from_millis(500)),
+            None
+        );
+        clock.set_vrr(false);
+        clock.presented(Duration::from_millis(500));
+        assert_eq!(
+            clock.cursor_update_deadline(Duration::from_millis(501)),
+            None
+        );
+    }
 
     #[test]
     fn render_deadlines_prioritize_earlier_refresh_and_expensive_outputs() {

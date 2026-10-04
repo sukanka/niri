@@ -2733,6 +2733,9 @@ impl Tty {
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
         // system.
+        let cursor_update_deadline = niri.output_state[output]
+            .frame_clock
+            .cursor_update_deadline(get_monotonic_time());
         let (flags, presentation_mode) = {
             let debug = &self.config.borrow().debug;
 
@@ -2759,11 +2762,8 @@ impl Tty {
             if debug.disable_cursor_plane {
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
             }
-            if debug.skip_cursor_only_updates_during_vrr {
-                let output_state = niri.output_state.get(output).unwrap();
-                if output_state.frame_clock.vrr() {
-                    flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
-                }
+            if debug.skip_cursor_only_updates_during_vrr && cursor_update_deadline.is_some() {
+                flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
             }
 
             if blend_hdr {
@@ -2884,6 +2884,9 @@ impl Tty {
                                 .map(|_| drm_compositor.vrr_enabled());
                             surface.last_frame_status = Some(frame_status);
                             let output_state = niri.output_state.get_mut(output).unwrap();
+                            if let Some(token) = output_state.cursor_update_timer.take() {
+                                niri.event_loop.remove(token);
+                            }
                             let new_state = RedrawState::WaitingForVBlank {
                                 redraw_needed: false,
                             };
@@ -2911,6 +2914,11 @@ impl Tty {
                     }
                 } else {
                     rv = RenderResult::NoDamage;
+                    if flags.contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES) {
+                        if let Some(deadline) = cursor_update_deadline {
+                            queue_cursor_update_timer(niri, output, deadline);
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -4078,6 +4086,30 @@ fn suspend() -> anyhow::Result<()> {
     .context("error suspending")?;
 
     Ok(())
+}
+
+fn queue_cursor_update_timer(niri: &mut Niri, output: &Output, deadline: Duration) {
+    let state = niri.output_state.get_mut(output).unwrap();
+    if state.cursor_update_timer.is_some() {
+        return;
+    }
+    let weak = output.downgrade();
+    let token = niri
+        .event_loop
+        .insert_source(
+            Timer::from_duration(deadline.saturating_sub(get_monotonic_time())),
+            move |_, _, state| {
+                if let Some(output) = weak.upgrade() {
+                    if let Some(output_state) = state.niri.output_state.get_mut(&output) {
+                        output_state.cursor_update_timer = None;
+                        state.niri.queue_redraw(&output);
+                    }
+                }
+                TimeoutAction::Drop
+            },
+        )
+        .unwrap();
+    state.cursor_update_timer = Some(token);
 }
 
 fn queue_estimated_vblank_timer(
