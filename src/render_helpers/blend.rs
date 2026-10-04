@@ -1544,6 +1544,79 @@ mod tests {
     }
 
     #[test]
+    fn post_blend_scrgb_matches_shader_with_sampled_gamma_lut() {
+        let peak = 554.;
+        let encode = hdr_post_blend_encode(peak);
+        let transform = scanout_color_transform(
+            ContentColor::from_description(Some(ImageDescription::WINDOWS_SCRGB)),
+            true,
+            200.,
+            peak,
+        )
+        .unwrap();
+        let linear = post_blend_linear_transform(transform, encode).unwrap();
+        assert_eq!(linear.decode, None);
+        assert_eq!(linear.encode, None);
+        let ctm = linear.ctm.unwrap();
+
+        // Model a 1024-entry UNORM16 CRTC LUT with linear interpolation.
+        let lut: Vec<_> = (0..1024)
+            .map(|i| {
+                let pq = encode.encode.eval(f64::from(i) / 1023. * encode.linear_max);
+                (pq * 65535.).round() / 65535.
+            })
+            .collect();
+        let sample_lut = |u: f64| {
+            let pos = u.clamp(0., 1.) * 1023.;
+            let i = (pos as usize).min(1022);
+            lut[i] + (lut[i + 1] - lut[i]) * (pos - i as f64)
+        };
+
+        for rgb in [
+            [0., 0., 0.],
+            [0.01, 0.01, 0.01],
+            [1., 1., 1.],
+            [2.5375, 2.5375, 2.5375],
+            [6., 6., 6.],
+            [1., 0., 0.],
+            [0., 1., 0.],
+            [0., 0., 1.],
+            [4., 0.5, 0.1],
+            // A negative scRGB channel can still map wholly inside BT.2020; do not
+            // clamp it before converting the gamut.
+            [-0.25, 1., 0.25],
+        ] {
+            let (r, g, b) = bt709_to_bt2020(rgb[0], rgb[1], rgb[2]);
+            for (row, channel) in [r, g, b].into_iter().enumerate() {
+                let u = (0..3)
+                    .map(|col| ctm[row * 4 + col] * f64::from(rgb[col]) * linear.multiplier)
+                    .sum::<f64>()
+                    + ctm[row * 4 + 3];
+                assert!((0. ..=1.).contains(&u), "sample must not clip: {rgb:?}");
+                // scRGB 1.0 is 80 nits, with reference white adjusted from 203 to 200.
+                let expected = f64::from(pq_encode(channel * (80. / 10000. * 200. / 203.)));
+                let exact = encode.encode.eval(u * encode.linear_max);
+                assert!((exact - expected).abs() < 0.00002, "{rgb:?}, channel {row}");
+                // Allow 2.6 ten-bit PQ codes for the low-luminance samples; brighter
+                // samples have much less error from the coarse linear-light LUT.
+                assert!(
+                    (sample_lut(u) - expected).abs() < 0.0025,
+                    "{rgb:?}, channel {row}: LUT {}, shader {expected}",
+                    sample_lut(u)
+                );
+            }
+        }
+
+        // The first interval spans about 0.54 nits. Interpolation here crushes shadows;
+        // it cannot explain an overall lift of black or a washed-out image.
+        assert_eq!(sample_lut(0.), 0.);
+        for nits in [0.01, 0.05, 0.1, 0.25] {
+            let expected = f64::from(pq_encode((nits / 10000.) as f32));
+            assert!(sample_lut(nits / peak) < expected);
+        }
+    }
+
+    #[test]
     fn content_color_classification() {
         use smithay::wayland::color::management::PrimariesOption;
 
