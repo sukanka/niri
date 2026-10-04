@@ -1557,6 +1557,15 @@ impl Tty {
             );
         }
 
+        // Probe formats with the color state that the first real frame will use.
+        // Staging only issues TEST_ONLY requests; the mode and HDR state are applied
+        // together when the first frame is queued.
+        let color_state =
+            initial_connector_color_state(&config, hdr_supported, edid_hdr, &max_bpc_range);
+        if let Err(err) = surface.use_color_state(color_state) {
+            warn!("error staging initial connector color state: {err:?}");
+        }
+
         // Log the color pipelines (kernel drm_colorop API, Linux 6.19+) the primary plane
         // offers. The DrmCompositor discovers them for every plane on its own and resolves the
         // per-element scanout color transforms against them (see use_color_transforms), so that
@@ -1924,17 +1933,6 @@ impl Tty {
                 )
                 .context("error creating 8-bit DRM compositor after 10-bit render probe failed")?;
             }
-        }
-
-        // Stage the initial connector color state (SDR, with the configured max bpc) so it
-        // rides the initial modeset as part of the same atomic commit.
-        let max_bpc = effective_max_bpc(&config, &max_bpc_range);
-        if let Err(err) = compositor.use_color_state(ConnectorColorState {
-            colorspace: Colorspace::Default,
-            hdr_metadata: None,
-            max_bpc,
-        }) {
-            warn!("error staging initial connector color state: {err:?}");
         }
 
         if self.debug_tint {
@@ -2543,27 +2541,16 @@ impl Tty {
                 // With mode="on" it always comes from the sink's EDID. In auto mode, entering HDR
                 // is a modeset regardless, so it is taken from the content that engages HDR and
                 // then kept until HDR is left.
-                let edid_desc = ImageDescription {
-                    transfer: CmTransferFunction::St2084Pq,
-                    primaries: CmPrimariesOption {
-                        named: Some(CmPrimaries::Bt2020),
-                        values: None,
-                    },
-                    max_cll: None,
-                    max_fall: None,
-                    mastering_luminance: None,
-                    mastering_primaries: None,
-                    luminances: None,
-                    windows_scrgb: false,
-                    windows_bt2100: false,
-                };
                 let pending = surface.compositor.pending_color_state();
                 let hdr_metadata = match pending.hdr_metadata {
                     Some(metadata) if !always_on && pending.colorspace == Colorspace::Bt2020Rgb => {
                         metadata
                     }
-                    _ if always_on => build_hdr_metadata(&edid_desc, &edid_hdr),
-                    _ => build_hdr_metadata(hdr_desc.as_ref().unwrap_or(&edid_desc), &edid_hdr),
+                    _ if always_on => display_hdr_metadata(&edid_hdr),
+                    _ => hdr_desc
+                        .as_ref()
+                        .map(|desc| build_hdr_metadata(desc, &edid_hdr))
+                        .unwrap_or_else(|| display_hdr_metadata(&edid_hdr)),
                 };
                 ConnectorColorState {
                     colorspace: Colorspace::Bt2020Rgb,
@@ -4422,6 +4409,48 @@ fn describe_color_pipeline(pipeline: &ColorPipeline) -> String {
     ops.join(" → ")
 }
 
+/// The stable HDR metadata for an always-on output, used during setup and rendering.
+fn display_hdr_metadata(edid: &EdidHdrInfo) -> HdrOutputMetadata {
+    let desc = ImageDescription {
+        transfer: CmTransferFunction::St2084Pq,
+        primaries: CmPrimariesOption {
+            named: Some(CmPrimaries::Bt2020),
+            values: None,
+        },
+        max_cll: None,
+        max_fall: None,
+        mastering_luminance: None,
+        mastering_primaries: None,
+        luminances: None,
+        windows_scrgb: false,
+        windows_bt2100: false,
+    };
+    build_hdr_metadata(&desc, edid)
+}
+
+fn initial_connector_color_state(
+    config: &niri_config::Output,
+    hdr_supported: bool,
+    edid: EdidHdrInfo,
+    max_bpc_range: &Option<RangeInclusive<u32>>,
+) -> ConnectorColorState {
+    let hdr_config = config.hdr.as_ref();
+    let hdr_metadata = (hdr_supported && hdr_config.is_some_and(|hdr| hdr.mode == HdrMode::On))
+        .then(|| {
+            let peak_luminance = hdr_config.and_then(|hdr| hdr.peak_luminance).map(|v| v.0);
+            display_hdr_metadata(&edid.with_peak_luminance(peak_luminance))
+        });
+    ConnectorColorState {
+        colorspace: if hdr_metadata.is_some() {
+            Colorspace::Bt2020Rgb
+        } else {
+            Colorspace::Default
+        },
+        hdr_metadata,
+        max_bpc: effective_max_bpc(config, max_bpc_range),
+    }
+}
+
 /// Builds the HDR static metadata to signal on the connector for a client's image description:
 /// a PQ infoframe with the description's mastering display primaries (target color volume),
 /// falling back to its container primaries when the client didn't provide any.
@@ -4700,9 +4729,86 @@ mod tests {
 
     use crate::backend::tty::{
         build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt,
-        composition_render_node, effective_vrr, feedback_formats, presentation_mode, EdidHdrInfo,
-        FrameRenderStatus,
+        composition_render_node, display_hdr_metadata, effective_vrr, feedback_formats,
+        initial_connector_color_state, presentation_mode, EdidHdrInfo, FrameRenderStatus,
     };
+
+    #[test]
+    fn initial_hdr_state_matches_runtime_metadata_and_peak_override() {
+        use niri_config::output::{Hdr, HdrMode};
+        use niri_config::FloatOrInt;
+        use smithay::backend::drm::color::{Colorspace, ConnectorColorState};
+
+        let config = niri_config::Output {
+            hdr: Some(Hdr {
+                mode: HdrMode::On,
+                peak_luminance: Some(FloatOrInt(400.4)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let edid = EdidHdrInfo {
+            pq: true,
+            bt2020_rgb: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
+        };
+        let initial = initial_connector_color_state(&config, true, edid, &Some(8..=16));
+        let metadata = initial.hdr_metadata.unwrap();
+        assert_eq!(metadata.max_display_mastering_luminance, 400);
+        assert_eq!(metadata.max_cll, 400);
+        assert_eq!(metadata.max_fall, 400);
+        assert_eq!(
+            initial,
+            ConnectorColorState {
+                colorspace: Colorspace::Bt2020Rgb,
+                hdr_metadata: Some(display_hdr_metadata(&edid.with_peak_luminance(Some(400.4)))),
+                max_bpc: Some(10),
+            }
+        );
+    }
+
+    #[test]
+    fn initial_hdr_state_keeps_auto_and_unsupported_outputs_in_sdr() {
+        use niri_config::output::{Hdr, HdrMode};
+        use smithay::backend::drm::color::{Colorspace, ConnectorColorState};
+
+        for (hdr, supported, max_bpc) in [
+            (None, true, None),
+            (Some(Hdr::default()), true, Some(10)),
+            (
+                Some(Hdr {
+                    mode: HdrMode::On,
+                    ..Default::default()
+                }),
+                false,
+                Some(10),
+            ),
+        ] {
+            let config = niri_config::Output {
+                hdr,
+                ..Default::default()
+            };
+            assert_eq!(
+                initial_connector_color_state(
+                    &config,
+                    supported,
+                    EdidHdrInfo::default(),
+                    &Some(8..=16)
+                ),
+                ConnectorColorState {
+                    colorspace: Colorspace::Default,
+                    hdr_metadata: None,
+                    max_bpc
+                }
+            );
+            assert_eq!(
+                initial_connector_color_state(&config, false, EdidHdrInfo::default(), &None),
+                ConnectorColorState::default()
+            );
+        }
+    }
 
     #[test]
     fn render_status_preserves_unknown_and_actual_presentation_modes() {
