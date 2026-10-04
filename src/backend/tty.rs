@@ -35,7 +35,9 @@ use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::RenderElementPresentationState;
+use smithay::backend::renderer::element::{
+    RenderElementPresentationState, RenderElementStates, RenderingReason,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::vulkan::VulkanBackend;
@@ -420,6 +422,8 @@ struct Surface {
     /// Whether the last rendered frame did direct scan-out on the primary plane. `None` until
     /// the first frame. Used to log scan-out transitions.
     was_direct_scanout: Option<bool>,
+    /// Render state of the last frame successfully submitted to DRM, for on-demand diagnostics.
+    last_frame_status: Option<FrameRenderStatus>,
     /// Last lock state reconciled with the output's refresh policy.
     was_locked: bool,
     gamma_props: Option<GammaProps>,
@@ -436,6 +440,66 @@ struct Surface {
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameRenderStatus {
+    direct_scanout: bool,
+    presentation_mode: Option<PresentationMode>,
+    vrr_enabled: Option<bool>,
+    // A fixed-size set avoids allocating diagnostic strings on the render path.
+    scanout_failures: [bool; 5],
+}
+
+impl FrameRenderStatus {
+    fn new(direct_scanout: bool, states: &RenderElementStates) -> Self {
+        let mut scanout_failures = [false; 5];
+        for state in states.states.values() {
+            if let RenderElementPresentationState::Rendering {
+                reason: Some(reason),
+            } = state.presentation_state
+            {
+                let index = match reason {
+                    RenderingReason::FormatUnsupported => 0,
+                    RenderingReason::AsyncFormatUnsupported => 1,
+                    RenderingReason::ScanoutFailed => 2,
+                    RenderingReason::AsyncScanoutFailed => 3,
+                    RenderingReason::ColorTransformUnsupported => 4,
+                };
+                scanout_failures[index] = true;
+            }
+        }
+        Self {
+            direct_scanout,
+            presentation_mode: None,
+            vrr_enabled: None,
+            scanout_failures,
+        }
+    }
+
+    fn to_ipc(self) -> niri_ipc::OutputFrameStatus {
+        use niri_ipc::ScanoutFailureReason as Reason;
+
+        niri_ipc::OutputFrameStatus {
+            direct_scanout: self.direct_scanout,
+            presentation_mode: self.presentation_mode.map(|mode| match mode {
+                PresentationMode::VSync => niri_ipc::OutputPresentationMode::VSync,
+                PresentationMode::Async => niri_ipc::OutputPresentationMode::Async,
+            }),
+            scanout_failures: self
+                .scanout_failures
+                .into_iter()
+                .zip([
+                    Reason::FormatUnsupported,
+                    Reason::AsyncFormatUnsupported,
+                    Reason::ScanoutFailed,
+                    Reason::AsyncScanoutFailed,
+                    Reason::ColorTransformUnsupported,
+                ])
+                .filter_map(|(present, reason)| present.then_some(reason))
+                .collect(),
+        }
+    }
 }
 
 pub struct SurfaceDmabufFeedback {
@@ -1940,6 +2004,7 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             was_direct_scanout: None,
+            last_frame_status: None,
             was_locked: niri.is_locked(),
             gamma_props,
             pending_gamma_change: None,
@@ -2300,6 +2365,41 @@ impl Tty {
             self.primary_render_node,
             output_node,
         )
+    }
+
+    pub fn render_status(&self, output: &Output) -> niri_ipc::OutputRenderStatus {
+        let state = output.user_data().get::<TtyOutputState>().unwrap();
+        let device = self.devices.get(&state.node);
+        let surface = device.and_then(|device| device.surfaces.get(&state.crtc));
+        let render_node = self.render_node_for_output(output);
+        let node_name = |node: DrmNode| {
+            node.dev_path().map_or_else(
+                || node.to_string(),
+                |path| path.to_string_lossy().into_owned(),
+            )
+        };
+
+        niri_ipc::OutputRenderStatus {
+            name: output.name(),
+            render_node: Some(node_name(render_node)),
+            scanout_node: Some(node_name(state.node)),
+            cross_gpu_composition: device
+                .and_then(|device| device.render_node)
+                .map(|output_node| render_node != output_node),
+            vrr_enabled: surface
+                .and_then(|surface| surface.last_frame_status)
+                .and_then(|frame| frame.vrr_enabled),
+            hdr_enabled: surface.map(|surface| {
+                surface
+                    .compositor
+                    .current_color_state()
+                    .hdr_metadata
+                    .is_some()
+            }),
+            last_frame: surface
+                .and_then(|surface| surface.last_frame_status)
+                .map(FrameRenderStatus::to_ipc),
+        }
     }
 
     /// Uses the same GPU as composition, without copying to the output's scanout GPU.
@@ -2755,9 +2855,21 @@ impl Tty {
                     let presentation_feedbacks =
                         niri.take_presentation_feedbacks(output, &res.states);
                     let data = (presentation_feedbacks, target_presentation_time);
+                    let mut frame_status = FrameRenderStatus::new(is_direct_scanout, &res.states);
 
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
+                            // Read the mode accepted by DRM: an async request may fall back to
+                            // VSync. Failed or empty frames must not replace this snapshot.
+                            frame_status.presentation_mode = drm_compositor
+                                .pending_frame()
+                                .map(|frame| frame.presentation_mode);
+                            // Smithay's VRR accessor reads staged state. Only expose it once
+                            // a frame using that state has actually been submitted.
+                            frame_status.vrr_enabled = frame_status
+                                .presentation_mode
+                                .map(|_| drm_compositor.vrr_enabled());
+                            surface.last_frame_status = Some(frame_status);
                             let output_state = niri.output_state.get_mut(output).unwrap();
                             let new_state = RedrawState::WaitingForVBlank {
                                 redraw_needed: false,
@@ -4544,7 +4656,65 @@ mod tests {
     use crate::backend::tty::{
         build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt,
         composition_render_node, effective_vrr, feedback_formats, presentation_mode, EdidHdrInfo,
+        FrameRenderStatus,
     };
+
+    #[test]
+    fn render_status_preserves_unknown_and_actual_presentation_modes() {
+        use niri_ipc::OutputPresentationMode;
+        use smithay::backend::renderer::element::RenderElementStates;
+        use smithay::backend::renderer::PresentationMode;
+
+        let mut status = FrameRenderStatus::new(true, &RenderElementStates::default());
+        assert!(status.to_ipc().direct_scanout);
+        assert_eq!(status.to_ipc().presentation_mode, None);
+
+        // Report the accepted mode, including a requested async flip that fell back to VSync.
+        for (mode, expected) in [
+            (PresentationMode::VSync, OutputPresentationMode::VSync),
+            (PresentationMode::Async, OutputPresentationMode::Async),
+        ] {
+            status.presentation_mode = Some(mode);
+            assert_eq!(status.to_ipc().presentation_mode, Some(expected));
+        }
+    }
+
+    #[test]
+    fn render_status_deduplicates_element_scanout_failures() {
+        use niri_ipc::ScanoutFailureReason as Reason;
+        use smithay::backend::renderer::element::{
+            Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
+            RenderingReason,
+        };
+
+        let mut states = RenderElementStates::default();
+        for reason in [
+            None,
+            Some(RenderingReason::ColorTransformUnsupported),
+            Some(RenderingReason::FormatUnsupported),
+            Some(RenderingReason::ColorTransformUnsupported),
+            Some(RenderingReason::AsyncScanoutFailed),
+        ] {
+            states.states.insert(
+                Id::new(),
+                RenderElementState {
+                    visible_area: 100,
+                    presentation_state: RenderElementPresentationState::Rendering { reason },
+                    needs_capture: false,
+                },
+            );
+        }
+        let status = FrameRenderStatus::new(false, &states).to_ipc();
+        assert!(!status.direct_scanout);
+        assert_eq!(
+            status.scanout_failures,
+            vec![
+                Reason::FormatUnsupported,
+                Reason::AsyncScanoutFailed,
+                Reason::ColorTransformUnsupported,
+            ]
+        );
+    }
 
     #[test]
     fn lock_refresh_policy_restores_configured_vrr_on_unlock() {

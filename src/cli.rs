@@ -66,6 +66,8 @@ pub enum Sub {
 pub enum Msg {
     /// List connected outputs.
     Outputs,
+    /// Print rendering diagnostics and the last submitted DRM frame status for mapped outputs.
+    RenderStatus,
     /// List workspaces.
     Workspaces,
     /// List open windows.
@@ -137,6 +139,31 @@ impl TryFrom<CompletionShell> for Shell {
             CompletionShell::PowerShell => Ok(Shell::PowerShell),
             CompletionShell::Zsh => Ok(Shell::Zsh),
             CompletionShell::Nushell => Err("Nushell should be handled separately"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_status_command() {
+        for args in [
+            vec!["niri", "msg", "render-status"],
+            vec!["niri", "msg", "--json", "render-status"],
+        ] {
+            let expects_json = args.contains(&"--json");
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Sub::Msg {
+                msg: Msg::RenderStatus,
+                json,
+                print_request: false,
+            }) = cli.subcommand
+            else {
+                panic!("expected render-status command");
+            };
+            assert_eq!(json, expects_json);
         }
     }
 }

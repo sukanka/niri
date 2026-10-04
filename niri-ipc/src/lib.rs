@@ -69,6 +69,8 @@ pub enum Request {
     Version,
     /// Request information about connected outputs.
     Outputs,
+    /// Request rendering diagnostics for mapped outputs, including their last submitted DRM frame.
+    RenderStatus,
     /// Request information about workspaces.
     Workspaces,
     /// Request information about open windows.
@@ -143,6 +145,8 @@ pub enum Response {
     ///
     /// Map from output name to output info.
     Outputs(HashMap<String, Output>),
+    /// Rendering diagnostics for mapped outputs.
+    RenderStatus(Vec<OutputRenderStatus>),
     /// Information about workspaces.
     Workspaces(Vec<Workspace>),
     /// Information about open windows.
@@ -1262,6 +1266,80 @@ pub struct Output {
     pub max_bpc: Option<u8>,
 }
 
+/// Rendering diagnostics for one mapped output.
+///
+/// Optional fields are `None` when the backend cannot report them. In particular, nested
+/// and headless backends do not have DRM scanout state. This is a status snapshot, not a
+/// measurement of frame rate or input latency.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct OutputRenderStatus {
+    /// Name of the output.
+    pub name: String,
+    /// DRM render node used for composition, if known.
+    pub render_node: Option<String>,
+    /// DRM node driving the output, if known.
+    pub scanout_node: Option<String>,
+    /// Whether composition uses a different GPU from the one driving the output.
+    ///
+    /// This describes the composition topology. It does not describe the GPU that produced
+    /// a game's buffer, and does not imply that a directly scanned-out frame was copied.
+    pub cross_gpu_composition: Option<bool>,
+    /// Whether variable refresh rate was enabled for the last successfully submitted DRM frame.
+    ///
+    /// `None` before a successful submission or when the backend cannot report it. This may
+    /// precede a configuration change, unlike the current HDR state below.
+    pub vrr_enabled: Option<bool>,
+    /// Whether HDR output is currently enabled, if known.
+    pub hdr_enabled: Option<bool>,
+    /// The most recent frame successfully submitted to DRM.
+    ///
+    /// `None` before a successful submission or when the backend has no DRM frame state.
+    /// The frame may precede the current configuration and need not have been presented yet.
+    pub last_frame: Option<OutputFrameStatus>,
+}
+
+/// Diagnostics for a frame successfully submitted to DRM.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct OutputFrameStatus {
+    /// Whether the frame used direct scanout rather than compositing the primary plane.
+    pub direct_scanout: bool,
+    /// The presentation mode used for the submission, if known, rather than a requested hint.
+    pub presentation_mode: Option<OutputPresentationMode>,
+    /// Distinct scanout failures observed for render elements in this frame.
+    ///
+    /// These can come from any element, not just the main window. They are not an exhaustive
+    /// explanation of why composition occurred; an empty list does not prove direct scanout.
+    pub scanout_failures: Vec<ScanoutFailureReason>,
+}
+
+/// Presentation mode used for a successfully submitted DRM frame.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum OutputPresentationMode {
+    /// Submission synchronized to vertical blanking.
+    VSync,
+    /// Asynchronous submission, allowing tearing.
+    Async,
+}
+
+/// A reason an element could not be scanned out directly.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ScanoutFailureReason {
+    /// The buffer format or modifier was unsupported for scanout.
+    FormatUnsupported,
+    /// The buffer format or modifier was unsupported for asynchronous scanout.
+    AsyncFormatUnsupported,
+    /// A scanout attempt failed.
+    ScanoutFailed,
+    /// An asynchronous scanout attempt failed.
+    AsyncScanoutFailed,
+    /// The required color transform was unsupported for scanout.
+    ColorTransformUnsupported,
+}
+
 /// Output mode.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -2150,6 +2228,88 @@ impl OutputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_status_unknown_json() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#""RenderStatus""#).unwrap(),
+            Request::RenderStatus
+        ));
+        assert_eq!(
+            serde_json::to_string(&Request::RenderStatus).unwrap(),
+            r#""RenderStatus""#
+        );
+
+        let wire = serde_json::json!({
+            "RenderStatus": [{
+                "name": "winit",
+                "render_node": null,
+                "scanout_node": null,
+                "cross_gpu_composition": null,
+                "vrr_enabled": null,
+                "hdr_enabled": null,
+                "last_frame": null
+            }]
+        });
+        let response: Response = serde_json::from_value(wire.clone()).unwrap();
+        let Response::RenderStatus(outputs) = &response else {
+            panic!("expected render status");
+        };
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].cross_gpu_composition, None);
+        assert_eq!(outputs[0].vrr_enabled, None);
+        assert_eq!(outputs[0].last_frame, None);
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+    }
+
+    #[test]
+    fn render_status_submitted_frame_json() {
+        for mode in [OutputPresentationMode::VSync, OutputPresentationMode::Async] {
+            let status = OutputRenderStatus {
+                name: "DP-1".to_owned(),
+                render_node: Some("/dev/dri/renderD128".to_owned()),
+                scanout_node: Some("/dev/dri/card1".to_owned()),
+                cross_gpu_composition: Some(true),
+                vrr_enabled: Some(true),
+                hdr_enabled: Some(false),
+                last_frame: Some(OutputFrameStatus {
+                    direct_scanout: false,
+                    presentation_mode: Some(mode),
+                    scanout_failures: vec![
+                        ScanoutFailureReason::FormatUnsupported,
+                        ScanoutFailureReason::AsyncFormatUnsupported,
+                        ScanoutFailureReason::ScanoutFailed,
+                        ScanoutFailureReason::AsyncScanoutFailed,
+                        ScanoutFailureReason::ColorTransformUnsupported,
+                    ],
+                }),
+            };
+            let wire = serde_json::to_value(Response::RenderStatus(vec![status.clone()])).unwrap();
+            let frame = &wire["RenderStatus"][0]["last_frame"];
+            assert_eq!(
+                frame["presentation_mode"],
+                if mode == OutputPresentationMode::VSync {
+                    "VSync"
+                } else {
+                    "Async"
+                }
+            );
+            assert_eq!(
+                frame["scanout_failures"],
+                serde_json::json!([
+                    "FormatUnsupported",
+                    "AsyncFormatUnsupported",
+                    "ScanoutFailed",
+                    "AsyncScanoutFailed",
+                    "ColorTransformUnsupported"
+                ])
+            );
+            let Response::RenderStatus(decoded) = serde_json::from_value(wire).unwrap() else {
+                panic!("expected render status");
+            };
+            assert_eq!(decoded, vec![status]);
+        }
+    }
 
     #[test]
     fn parse_size_change() {

@@ -234,6 +234,27 @@ impl Backend {
         matches!(self, Backend::Tty(tty) if tty.render_on_output_device())
     }
 
+    pub fn render_status(&self, niri: &Niri) -> Vec<niri_ipc::OutputRenderStatus> {
+        let mut outputs: Vec<_> = niri
+            .global_space
+            .outputs()
+            .map(|output| match self {
+                Backend::Tty(tty) => tty.render_status(output),
+                Backend::Winit(_) | Backend::Headless(_) => niri_ipc::OutputRenderStatus {
+                    name: output.name(),
+                    render_node: None,
+                    scanout_node: None,
+                    cross_gpu_composition: None,
+                    vrr_enabled: None,
+                    hdr_enabled: None,
+                    last_frame: None,
+                },
+            })
+            .collect();
+        outputs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        outputs
+    }
+
     pub fn render(
         &mut self,
         niri: &mut Niri,

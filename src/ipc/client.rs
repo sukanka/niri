@@ -8,7 +8,8 @@ use niri_config::OutputName;
 use niri_ipc::socket::Socket;
 use niri_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    OutputConfigChanged, OutputPresentationMode, OutputRenderStatus, Overview, Request, Response,
+    ScanoutFailureReason, Transform, Window, WindowLayout,
 };
 use serde_json::json;
 
@@ -32,6 +33,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
     let request = match &msg {
         Msg::Version => Request::Version,
         Msg::Outputs => Request::Outputs,
+        Msg::RenderStatus => Request::RenderStatus,
         Msg::FocusedWindow => Request::FocusedWindow,
         Msg::FocusedOutput => Request::FocusedOutput,
         Msg::PickWindow => Request::PickWindow,
@@ -178,6 +180,26 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             for (_name, output) in outputs.into_iter() {
                 print_output(output)?;
                 println!();
+            }
+        }
+        Msg::RenderStatus => {
+            let Response::RenderStatus(mut outputs) = response else {
+                bail!("unexpected response: expected RenderStatus, got {response:?}");
+            };
+
+            outputs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+            if json {
+                let status =
+                    serde_json::to_string(&outputs).context("error formatting response")?;
+                println!("{status}");
+                return Ok(());
+            }
+
+            if outputs.is_empty() {
+                println!("No output rendering status is available.");
+            }
+            for output in outputs {
+                println!("{}", format_render_status(&output));
             }
         }
         Msg::FocusedWindow => {
@@ -584,6 +606,91 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
     Ok(())
 }
 
+fn format_render_status(output: &OutputRenderStatus) -> String {
+    use std::fmt::Write as _;
+
+    let yes_no_unknown = |value| match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    let mut text = String::new();
+    writeln!(text, "Output {:?}:", output.name).unwrap();
+    writeln!(
+        text,
+        "  Render node: {}",
+        output.render_node.as_deref().unwrap_or("unknown")
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "  Scanout node: {}",
+        output.scanout_node.as_deref().unwrap_or("unknown")
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "  Cross-GPU composition topology: {}",
+        yes_no_unknown(output.cross_gpu_composition)
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "  VRR on last submitted frame: {}",
+        yes_no_unknown(output.vrr_enabled)
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "  HDR enabled: {}",
+        yes_no_unknown(output.hdr_enabled)
+    )
+    .unwrap();
+
+    if let Some(frame) = &output.last_frame {
+        writeln!(text, "  Last submitted DRM frame:").unwrap();
+        writeln!(
+            text,
+            "    Direct scanout: {}",
+            yes_no_unknown(Some(frame.direct_scanout))
+        )
+        .unwrap();
+        let mode = match frame.presentation_mode {
+            Some(OutputPresentationMode::VSync) => "VSync (synchronized)",
+            Some(OutputPresentationMode::Async) => "Async (tearing allowed)",
+            None => "unknown",
+        };
+        writeln!(text, "    Submitted presentation mode: {mode}").unwrap();
+        if frame.scanout_failures.is_empty() {
+            writeln!(text, "    Element scanout failures: none reported").unwrap();
+        } else {
+            writeln!(text, "    Element scanout failures (not exhaustive):").unwrap();
+            for failure in &frame.scanout_failures {
+                let reason = match failure {
+                    ScanoutFailureReason::FormatUnsupported => "format or modifier unsupported",
+                    ScanoutFailureReason::AsyncFormatUnsupported => {
+                        "format or modifier unsupported for asynchronous scanout"
+                    }
+                    ScanoutFailureReason::ScanoutFailed => "scanout failed",
+                    ScanoutFailureReason::AsyncScanoutFailed => "asynchronous scanout failed",
+                    ScanoutFailureReason::ColorTransformUnsupported => {
+                        "color transform unsupported"
+                    }
+                };
+                writeln!(text, "      {reason}").unwrap();
+            }
+        }
+    } else {
+        writeln!(
+            text,
+            "  Last submitted DRM frame: unknown (no submission or unavailable on this backend)"
+        )
+        .unwrap();
+    }
+
+    text
+}
+
 fn print_output(output: Output) -> anyhow::Result<()> {
     let Output {
         name,
@@ -845,6 +952,58 @@ mod tests {
     use insta::assert_snapshot;
 
     use super::*;
+
+    #[test]
+    fn render_status_unknown_text() {
+        let status = OutputRenderStatus {
+            name: "winit".to_owned(),
+            render_node: None,
+            scanout_node: None,
+            cross_gpu_composition: None,
+            vrr_enabled: None,
+            hdr_enabled: None,
+            last_frame: None,
+        };
+        assert_snapshot!(format_render_status(&status), @r#"
+        Output "winit":
+          Render node: unknown
+          Scanout node: unknown
+          Cross-GPU composition topology: unknown
+          VRR on last submitted frame: unknown
+          HDR enabled: unknown
+          Last submitted DRM frame: unknown (no submission or unavailable on this backend)
+        "#);
+    }
+
+    #[test]
+    fn render_status_submitted_frame_text() {
+        let status = OutputRenderStatus {
+            name: "DP-1".to_owned(),
+            render_node: Some("/dev/dri/renderD128".to_owned()),
+            scanout_node: Some("/dev/dri/card1".to_owned()),
+            cross_gpu_composition: Some(true),
+            vrr_enabled: Some(true),
+            hdr_enabled: Some(false),
+            last_frame: Some(niri_ipc::OutputFrameStatus {
+                direct_scanout: false,
+                presentation_mode: Some(OutputPresentationMode::Async),
+                scanout_failures: vec![ScanoutFailureReason::ColorTransformUnsupported],
+            }),
+        };
+        assert_snapshot!(format_render_status(&status), @r#"
+        Output "DP-1":
+          Render node: /dev/dri/renderD128
+          Scanout node: /dev/dri/card1
+          Cross-GPU composition topology: yes
+          VRR on last submitted frame: yes
+          HDR enabled: no
+          Last submitted DRM frame:
+            Direct scanout: no
+            Submitted presentation mode: Async (tearing allowed)
+            Element scanout failures (not exhaustive):
+              color transform unsupported
+        "#);
+    }
 
     #[test]
     fn test_fmt_rounded() {

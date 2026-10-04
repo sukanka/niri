@@ -8,6 +8,25 @@ For example, `niri msg --json outputs`.
 > If you're getting parsing errors from `niri msg` after upgrading niri, make sure that you've restarted niri itself.
 > You might be trying to run a newer `niri msg` against an older `niri` compositor.
 
+### Rendering Status
+
+Use these read-only commands to inspect rendering diagnostics for mapped outputs (those present in niri's layout):
+
+```sh
+niri msg render-status
+niri msg --json render-status
+```
+
+The response reports the composition render node, the DRM node driving the output, and whether composition would cross GPUs.
+`vrr_enabled` reports VRR for the most recent successfully submitted DRM frame and is unknown before the first successful submission; `hdr_enabled` reports the current DRM connector color state.
+`cross_gpu_composition` describes the composition topology; it does not identify the GPU that produced a game's buffer or imply that a directly scanned-out frame was copied.
+
+`last_frame` describes the most recent frame successfully submitted to DRM, including direct scanout and the actual submitted presentation mode (`VSync` or `Async`, which allows tearing), rather than a requested tearing hint.
+It may precede a configuration change and need not have been presented yet.
+`scanout_failures` contains distinct failures observed for any render element, not just the main window; it is not an exhaustive explanation of composition, and an empty list does not prove direct scanout.
+Unknown or unavailable fields are `null` in JSON, including DRM frame state on nested and headless backends or before the first successful submission.
+This is a status snapshot, not an FPS or latency measurement.
+
 ### Event Stream
 
 <sup>Since: 0.1.9</sup>

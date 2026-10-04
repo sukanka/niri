@@ -278,6 +278,18 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let outputs = ipc_outputs.values().cloned().map(|o| (o.name.clone(), o));
             Response::Outputs(outputs.collect())
         }
+        Request::RenderStatus => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let status = state.backend.render_status(&state.niri);
+                let _ = tx.send_blocking(status);
+            });
+            let status = rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error getting rendering status"))?;
+            Response::RenderStatus(status)
+        }
         Request::Workspaces => {
             let state = ctx.event_stream_state.borrow();
             let workspaces = state.workspaces.workspaces.values().cloned().collect();
