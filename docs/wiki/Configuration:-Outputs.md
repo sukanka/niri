@@ -359,22 +359,20 @@ output "HDMI-A-1" {
 <sup>Since: next release</sup>
 
 > [!CAUTION]
-> HDR support is experimental and currently limited to a **single fullscreen application**.
-> There is no color-managed compositing yet, so HDR will only look correct when one HDR
-> application is fullscreen and alone on the output.
+> HDR support is experimental. Niri color-manages composition of SDR and HDR content,
+> including windowed applications, effects, and the desktop. Output signalling and direct
+> scanout support depend on the GPU, display, and the required color transform.
 
 Opts this output into HDR. When present, niri:
 
-- tells clients on this output (through the always-advertised `wp-color-management-v1` protocol)
-  that it prefers HDR (PQ / BT.2020) content, so an HDR app, e.g. `mpv --vo=gpu-next` or gamescope,
-  can tell niri its content is HDR;
+- advertises output color preferences through `wp-color-management-v1`, according to the
+  selected HDR mode, and uses the color descriptions supplied by applications;
 - requests a 10-bit (or wider) scanout buffer, and at least 10 `max-bpc`;
-- while a fullscreen application is showing HDR (PQ / BT.2020) content, switches the output into HDR
-  mode (sets the connector to BT.2020 and attaches a PQ `HDR_OUTPUT_METADATA` infoframe), and reverts
-  to SDR when it stops.
+- enables BT.2020 / PQ signalling and a `HDR_OUTPUT_METADATA` infoframe while HDR is active;
+- converts content into the output blend space, with tone mapping when needed.
 
-The `wp-color-management-v1` protocol itself is always advertised; without an `hdr` node, every
-description niri hands out is plain sRGB, so behavior is unchanged. Adding or removing `hdr` at
+The `wp-color-management-v1` protocol itself is always advertised; without an `hdr` node, output
+preferences remain SDR. Adding or removing `hdr` at
 runtime (via a config reload) notifies clients of the changed preference — this also covers HDR
 outputs that are unplugged or disabled at login and enabled later. HDR signalling only works on the
 TTY backend, and requires a GPU/display that exposes the HDR connector properties (amdgpu, recent
@@ -394,9 +392,14 @@ The optional `mode` property controls when the output is in HDR:
   applications are told to prefer HDR upfront — use this for games that only probe HDR support once
   at startup. The `HDR_OUTPUT_METADATA` always describes the display itself (from its EDID) and
   never changes with the content, so there is no modeset when entering or leaving fullscreen (on
-  nvidia with DisplayPort, any metadata change would be one). Costs: SDR-only fullscreen
-  applications lose direct scanout on this output, and the cursor is rendered without the cursor
-  plane.
+  nvidia with DisplayPort, any metadata change would be one).
+
+HDR does not categorically disable direct scanout or the hardware cursor. Fullscreen content can
+scan out when its required color transform is supported by a plane; otherwise niri composites it.
+The optional [`scanout-post-blend-encode`](./Configuration:-Debug-Options.md#scanout-post-blend-encode)
+path can also use the CRTC gamma LUT for a compatible fullscreen frame. Normal SDR cursors are
+converted into the output blend space for the cursor plane; unsupported cursor content falls back
+to composition.
 
 The optional `reference-luminance` child (in cd/m²) is the luminance that SDR white (full white in
 an SDR application) is displayed at while the output is in HDR. Defaults to 203 (the BT.2408
@@ -409,8 +412,8 @@ specifications. The value is used to tone map content brighter than the display,
 `HDR_OUTPUT_METADATA` sent to the display (max luminance and MaxCLL), and in the luminances
 advertised to applications. Setting it on a display with correct EDID data only replaces that data.
 
-Screenshots and screencasts of HDR outputs are rendered in SDR; HDR application content appears
-washed out in them.
+Screenshots and screencasts of HDR outputs are rendered into an SDR blend space with color
+conversion and tone mapping. They do not preserve the output's HDR signal.
 
 ```kdl
 // Enable HDR on the internal display.
