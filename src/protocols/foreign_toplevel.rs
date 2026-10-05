@@ -137,37 +137,37 @@ pub fn refresh(state: &mut State) {
     // Save the focused window for last, this way when the focus changes, we will first deactivate
     // the previous window and only then activate the newly focused window.
     let mut focused = None;
-    let mut focused_is_minimized = false;
-    state.niri.layout.with_windows(|mapped, output, _, _| {
+    for (monitor, mapped) in state.niri.layout.windows() {
+        let output = monitor.map(|mon| mon.output());
         let toplevel = mapped.toplevel();
         let wl_surface = toplevel.wl_surface();
+        if state.niri.keyboard_focus.surface() == Some(wl_surface) {
+            focused = Some((mapped, output));
+            continue;
+        }
+
         with_toplevel_role_and_current(toplevel, |role, cur| {
             let Some(cur) = cur else {
                 error!("mapped must have had initial commit");
                 return;
             };
 
-            if state.niri.keyboard_focus.surface() == Some(wl_surface) {
-                focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
-                focused_is_minimized = mapped.is_minimized();
-            } else {
-                refresh_toplevel(
-                    protocol_state,
-                    wl_surface,
-                    mapped.id(),
-                    role,
-                    cur,
-                    output,
-                    false,
-                    mapped.is_minimized(),
-                );
-            }
+            refresh_toplevel(
+                protocol_state,
+                wl_surface,
+                mapped.id(),
+                role,
+                cur,
+                output,
+                false,
+                mapped.is_minimized(),
+            );
         });
-    });
+    }
 
     // Finally, refresh the focused window.
-    if let Some((identifier, window, output)) = focused {
-        let toplevel = window.toplevel().expect("no X11 support");
+    if let Some((mapped, output)) = focused {
+        let toplevel = mapped.toplevel();
         let wl_surface = toplevel.wl_surface();
         with_toplevel_role_and_current(toplevel, |role, cur| {
             let Some(cur) = cur else {
@@ -178,12 +178,12 @@ pub fn refresh(state: &mut State) {
             refresh_toplevel(
                 protocol_state,
                 wl_surface,
-                identifier,
+                mapped.id(),
                 role,
                 cur,
-                output.as_ref(),
+                output,
                 true,
-                focused_is_minimized,
+                mapped.is_minimized(),
             );
         });
     }
