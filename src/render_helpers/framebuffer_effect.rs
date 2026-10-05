@@ -252,18 +252,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             drop(guard);
 
             // Blit the framebuffer contents.
-            frame.with_context(|gl| unsafe {
+            frame.with_scratch_draw_framebuffer(|gl| unsafe {
                 while gl.GetError() != ffi::NO_ERROR {}
-
-                let mut current_fbo = 0i32;
-                gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
-
-                // BlitFramebuffer is affected by the scissor test, we don't want that.
-                gl.Disable(ffi::SCISSOR_TEST);
-
-                let mut fbo = 0;
-                gl.GenFramebuffers(1, &mut fbo as *mut _);
-                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
 
                 gl.FramebufferTexture2D(
                     ffi::DRAW_FRAMEBUFFER,
@@ -285,12 +275,6 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     ffi::COLOR_BUFFER_BIT,
                     ffi::LINEAR,
                 );
-
-                // Restore state set by GlesFrame that we just modified.
-                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
-                gl.Enable(ffi::SCISSOR_TEST);
-
-                gl.DeleteFramebuffers(1, &mut fbo as *mut _);
 
                 if gl.GetError() != ffi::NO_ERROR {
                     Err(GlesError::BlitError)
@@ -761,6 +745,100 @@ impl VulkanInner {
             blur: VulkanBlur::new(renderer),
             intermediate: None,
             subregion_damage: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::backend::renderer::{Bind as _, ExportMem as _, Renderer as _};
+
+    use super::*;
+
+    #[test]
+    fn capture_preserves_color_with_clipping_rotation_blur_and_hdr() {
+        let Some(mut renderer) = crate::tests::gpu::gles_renderer() else {
+            return;
+        };
+        let size = Size::from((8, 6));
+        let mut texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size).unwrap();
+        let geometry = Rectangle::new((-2., 1.).into(), (9., 8.).into());
+        let cache = UserDataMap::new();
+
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::Flipped90,
+        ] {
+            for blur in [
+                None,
+                Some(BlurOptions {
+                    passes: 2,
+                    offset: 3.,
+                }),
+            ] {
+                let effect = FramebufferEffect::new().render(
+                    None,
+                    RenderParams {
+                        geometry,
+                        subregion: None,
+                        clip: None,
+                        scale: 1.,
+                    },
+                    blur,
+                    0.,
+                    1.,
+                );
+                for blend in [None, Some((203., 1000.))] {
+                    crate::render_helpers::blend::set_frame_blend(&mut renderer, blend);
+                    // Readback leaves the source FBO's read selection at NONE for the next
+                    // capture. Repeated frames also exercise reuse of the effect textures.
+                    for _ in 0..2 {
+                        {
+                            let mut target = renderer.bind(&mut texture).unwrap();
+                            let mut frame = renderer
+                                .render(&mut target, (8, 6).into(), transform)
+                                .unwrap();
+                            frame
+                                .with_context(|gl| unsafe {
+                                    gl.ClearColor(0.25, 0.5, 0.75, 1.);
+                                    gl.Clear(ffi::COLOR_BUFFER_BIT);
+                                })
+                                .unwrap();
+                            let src = effect.src();
+                            let dst = effect.geometry(Scale::from(1.));
+                            RenderElement::<GlesRenderer>::capture_framebuffer(
+                                &effect, &mut frame, src, dst, &cache,
+                            )
+                            .unwrap();
+                            RenderElement::<GlesRenderer>::draw(
+                                &effect,
+                                &mut frame,
+                                src,
+                                dst,
+                                &[Rectangle::from_size(dst.size)],
+                                &[],
+                                Some(&cache),
+                            )
+                            .unwrap();
+                            frame.finish().unwrap().wait().unwrap();
+                        }
+                        let mapping = renderer
+                            .copy_texture(&texture, Rectangle::from_size(size), Fourcc::Abgr8888)
+                            .unwrap();
+                        let pixels = renderer.map_texture(&mapping).unwrap();
+                        for pixel in pixels.chunks_exact(4) {
+                            for (actual, expected) in pixel.iter().zip([64, 128, 191, 255]) {
+                                assert!(
+                                    actual.abs_diff(expected) <= 1,
+                                    "{transform:?}, blur={blur:?}, HDR={blend:?}: {pixel:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
