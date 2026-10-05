@@ -602,9 +602,11 @@ impl FrameBlendState {
     }
 
     /// The `niri_blend` uniform values for content already rendered in the frame blend space.
-    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> Vec<Uniform<'static>> {
+    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> [Uniform<'static>; 14] {
         let (_, scale, _) = Self::values_from_frame(frame);
-        let mut uniforms = vec![
+        let [use_gamut, gamut] = gamut_uniforms(false, None);
+        let [tonemap, tm_v, tm_ref_scale, tm_out_scale] = Self::tonemap_uniforms(false, 0., 0., 0.);
+        [
             Uniform::new("niri_hdr_pq", 0.0f32),
             Uniform::new("niri_ref_lum_scale", scale),
             Uniform::new("niri_hdr_ref_scale", 1.0f32),
@@ -613,14 +615,17 @@ impl FrameBlendState {
             Uniform::new("niri_linear_to_ref", 0.0f32),
             Uniform::new("niri_hdr_to_sdr", 0.0f32),
             Uniform::new("niri_pq_gamut", 0.0f32),
-        ];
-        uniforms.extend(gamut_uniforms(false, None));
-        uniforms.extend(Self::tonemap_uniforms(false, 0., 0., 0.));
-        uniforms
+            use_gamut,
+            gamut,
+            tonemap,
+            tm_v,
+            tm_ref_scale,
+            tm_out_scale,
+        ]
     }
 
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> Vec<Uniform<'static>> {
+    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 14] {
         Self::uniforms_for_content(frame, ContentColor::default())
     }
 
@@ -629,7 +634,10 @@ impl FrameBlendState {
     /// re-encoded through the gamut matrix), [`ContentColor::Linear`] selects the absolute
     /// extended-linear encode. HDR PQ content is converted back to SDR when drawn into SDR
     /// capture buffers.
-    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> Vec<Uniform<'static>> {
+    pub fn uniforms_for_content(
+        frame: &GlesFrame,
+        content: ContentColor,
+    ) -> [Uniform<'static>; 14] {
         let (hdr_pq, scale, max_luminance) = Self::values_from_frame(frame);
         Self::uniforms_for_content_values(hdr_pq, scale, max_luminance, content)
     }
@@ -663,9 +671,9 @@ impl FrameBlendState {
         scale: f32,
         max_luminance: f32,
         content: ContentColor,
-    ) -> Vec<Uniform<'static>> {
+    ) -> [Uniform<'static>; 14] {
         let values = Self::values_for_content(hdr_pq, scale, max_luminance, content);
-        let uniforms = vec![
+        [
             Uniform::new("niri_hdr_pq", values.hdr_pq),
             Uniform::new("niri_ref_lum_scale", values.ref_lum_scale),
             Uniform::new("niri_hdr_ref_scale", values.hdr_ref_scale),
@@ -686,8 +694,7 @@ impl FrameBlendState {
             Uniform::new("niri_tm_v", values.tm_v),
             Uniform::new("niri_tm_ref_scale", values.tm_ref_scale),
             Uniform::new("niri_tm_out_scale", values.tm_out_scale),
-        ];
-        uniforms
+        ]
     }
 
     /// Computes the raw `niri_blend` parameter block for a draw.
@@ -841,7 +848,7 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
 pub fn vulkan_blend_custom_uniforms(
     frame: &VulkanFrame,
     content: ContentColor,
-) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
+) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; 14] {
     vulkan_params_custom_uniforms(FrameBlendState::vulkan_params_for_content(frame, content))
 }
 
@@ -849,7 +856,7 @@ pub fn vulkan_blend_custom_uniforms(
 /// shader uniforms; the Vulkan counterpart of [`FrameBlendState::uniforms_for_blend_space`].
 pub fn vulkan_blend_space_custom_uniforms(
     frame: &VulkanFrame,
-) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
+) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; 14] {
     let p = FrameBlendState::vulkan_params_for_content(frame, ContentColor::default());
     let p = ColorBlendParams {
         hdr_pq: 0.0,
@@ -861,10 +868,10 @@ pub fn vulkan_blend_space_custom_uniforms(
 
 fn vulkan_params_custom_uniforms(
     p: ColorBlendParams,
-) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
+) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; 14] {
     use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
 
-    vec![
+    [
         CustomUniform {
             name: "niri_hdr_pq",
             value: CustomUniformValue::Float(p.hdr_pq),
@@ -1268,7 +1275,7 @@ fn adjust_tex_program_for_content(
             };
             let uniforms = FrameBlendState::uniforms_for_content(frame, content);
             crate::audit_texture_program!("texture_hdr");
-            frame.set_tex_program_override(Some((program, uniforms)));
+            frame.set_tex_program_override(Some((program, uniforms.into())));
             Some(saved)
         }
         ContentColor::HdrPq {
@@ -1299,7 +1306,7 @@ fn adjust_tex_program_for_content(
                         };
                         let uniforms = FrameBlendState::uniforms_for_content(frame, content);
                         crate::audit_texture_program!("texture_hdr");
-                        frame.set_tex_program_override(Some((program, uniforms)));
+                        frame.set_tex_program_override(Some((program, uniforms.into())));
                         Some(saved)
                     }
                 }
@@ -1344,7 +1351,7 @@ fn adjust_tex_program_for_content(
             };
             let uniforms = FrameBlendState::uniforms_for_content(frame, content);
             crate::audit_texture_program!("texture_hdr");
-            frame.set_tex_program_override(Some((program, uniforms)));
+            frame.set_tex_program_override(Some((program, uniforms.into())));
             Some(saved)
         }
     }
