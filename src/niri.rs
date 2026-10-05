@@ -20,6 +20,7 @@ use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
+use smallvec::SmallVec;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::ScanoutColorTransform;
 use smithay::backend::input::{InputTime, Keycode};
@@ -213,6 +214,9 @@ use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
+
+/// Inline storage for output lists, with heap spill for larger monitor setups.
+const INLINE_OUTPUT_CAPACITY: usize = 4;
 
 // We'll try to send frame callbacks at least once a second. We'll make a timer that fires once a
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
@@ -882,7 +886,7 @@ impl State {
         // build up (the 1 second frame callback timer will call this line).
         self.niri.advance_animations();
 
-        let mut captures = Vec::new();
+        let mut captures: SmallVec<[(Output, Duration); INLINE_OUTPUT_CAPACITY]> = SmallVec::new();
         for output in self.niri.queued_outputs() {
             if self.niri.is_queued(&output) {
                 let target = self.niri.redraw(&mut self.backend, &output);
@@ -4485,21 +4489,28 @@ impl Niri {
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
 
-    pub fn queued_outputs(&self) -> Vec<Output> {
+    pub fn queued_outputs(&self) -> SmallVec<[Output; INLINE_OUTPUT_CAPACITY]> {
         let now = get_monotonic_time();
-        let mut outputs: Vec<_> = self.output_state.keys().cloned().collect();
+        let mut outputs: SmallVec<[(Duration, &str, &Output); INLINE_OUTPUT_CAPACITY]> = self
+            .output_state
+            .iter()
+            .map(|(output, state)| {
+                let name = output.user_data().get::<OutputName>().unwrap();
+                (
+                    state.frame_clock.render_start_deadline(now),
+                    name.connector.as_str(),
+                    output,
+                )
+            })
+            .collect();
         // An expensive low-refresh output must not arbitrarily run ahead of a
         // higher-refresh output whose submission deadline is about to expire.
         // Keep all outputs here: commit-timing wakeups also iterate this list.
-        outputs.sort_by_cached_key(|output| {
-            (
-                self.output_state[output]
-                    .frame_clock
-                    .render_start_deadline(now),
-                output.name(),
-            )
-        });
+        outputs.sort_by_key(|(deadline, name, _)| (*deadline, *name));
         outputs
+            .into_iter()
+            .map(|(_, _, output)| output.clone())
+            .collect()
     }
 
     pub fn is_queued(&self, output: &Output) -> bool {
