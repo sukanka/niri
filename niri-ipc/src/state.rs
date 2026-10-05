@@ -128,10 +128,8 @@ impl EventStreamStatePart for WorkspacesState {
                 self.workspaces = workspaces.into_iter().map(|ws| (ws.id, ws)).collect();
             }
             Event::WorkspaceUrgencyChanged { id, urgent } => {
-                for ws in self.workspaces.values_mut() {
-                    if ws.id == id {
-                        ws.is_urgent = urgent;
-                    }
+                if let Some(ws) = self.workspaces.get_mut(&id) {
+                    ws.is_urgent = urgent;
                 }
             }
             Event::WorkspaceActivated { id, focused } => {
@@ -209,19 +207,13 @@ impl EventStreamStatePart for WindowsState {
                 id,
                 focus_timestamp,
             } => {
-                for win in self.windows.values_mut() {
-                    if win.id == id {
-                        win.focus_timestamp = focus_timestamp;
-                        break;
-                    }
+                if let Some(win) = self.windows.get_mut(&id) {
+                    win.focus_timestamp = focus_timestamp;
                 }
             }
             Event::WindowUrgencyChanged { id, urgent } => {
-                for win in self.windows.values_mut() {
-                    if win.id == id {
-                        win.is_urgent = urgent;
-                        break;
-                    }
+                if let Some(win) = self.windows.get_mut(&id) {
+                    win.is_urgent = urgent;
                 }
             }
             Event::WindowLayoutsChanged { changes } => {
