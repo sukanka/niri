@@ -34,6 +34,9 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 /// Default SDR reference white in cd/m² (BT.2408).
 pub const DEFAULT_REFERENCE_LUMINANCE: f64 = 203.;
 
+/// Number of uniforms in a complete `niri_blend` parameter block.
+pub const BLEND_UNIFORM_COUNT: usize = 14;
+
 /// Relative headroom below which tone mapping is skipped and clipping suffices (KWin uses the
 /// same epsilon).
 const TONEMAP_ETA: f64 = 1.001;
@@ -539,7 +542,7 @@ impl FrameBlendState {
     /// declared when the program was compiled. Over-declaring is harmless (names the GLSL does
     /// not use resolve to location -1, which GL ignores), so programs declare the full set
     /// even when they only use a subset.
-    pub fn uniform_names() -> [UniformName<'static>; 14] {
+    pub fn uniform_names() -> [UniformName<'static>; BLEND_UNIFORM_COUNT] {
         [
             UniformName::new("niri_hdr_pq", UniformType::_1f),
             UniformName::new("niri_ref_lum_scale", UniformType::_1f),
@@ -602,7 +605,7 @@ impl FrameBlendState {
     }
 
     /// The `niri_blend` uniform values for content already rendered in the frame blend space.
-    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> [Uniform<'static>; 14] {
+    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> [Uniform<'static>; BLEND_UNIFORM_COUNT] {
         let (_, scale, _) = Self::values_from_frame(frame);
         let [use_gamut, gamut] = gamut_uniforms(false, None);
         let [tonemap, tm_v, tm_ref_scale, tm_out_scale] = Self::tonemap_uniforms(false, 0., 0., 0.);
@@ -625,7 +628,7 @@ impl FrameBlendState {
     }
 
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 14] {
+    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; BLEND_UNIFORM_COUNT] {
         Self::uniforms_for_content(frame, ContentColor::default())
     }
 
@@ -637,7 +640,7 @@ impl FrameBlendState {
     pub fn uniforms_for_content(
         frame: &GlesFrame,
         content: ContentColor,
-    ) -> [Uniform<'static>; 14] {
+    ) -> [Uniform<'static>; BLEND_UNIFORM_COUNT] {
         let (hdr_pq, scale, max_luminance) = Self::values_from_frame(frame);
         Self::uniforms_for_content_values(hdr_pq, scale, max_luminance, content)
     }
@@ -671,7 +674,7 @@ impl FrameBlendState {
         scale: f32,
         max_luminance: f32,
         content: ContentColor,
-    ) -> [Uniform<'static>; 14] {
+    ) -> [Uniform<'static>; BLEND_UNIFORM_COUNT] {
         let values = Self::values_for_content(hdr_pq, scale, max_luminance, content);
         [
             Uniform::new("niri_hdr_pq", values.hdr_pq),
@@ -848,7 +851,7 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
 pub fn vulkan_blend_custom_uniforms(
     frame: &VulkanFrame,
     content: ContentColor,
-) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; 14] {
+) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; BLEND_UNIFORM_COUNT] {
     vulkan_params_custom_uniforms(FrameBlendState::vulkan_params_for_content(frame, content))
 }
 
@@ -856,7 +859,7 @@ pub fn vulkan_blend_custom_uniforms(
 /// shader uniforms; the Vulkan counterpart of [`FrameBlendState::uniforms_for_blend_space`].
 pub fn vulkan_blend_space_custom_uniforms(
     frame: &VulkanFrame,
-) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; 14] {
+) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; BLEND_UNIFORM_COUNT] {
     let p = FrameBlendState::vulkan_params_for_content(frame, ContentColor::default());
     let p = ColorBlendParams {
         hdr_pq: 0.0,
@@ -868,7 +871,7 @@ pub fn vulkan_blend_space_custom_uniforms(
 
 fn vulkan_params_custom_uniforms(
     p: ColorBlendParams,
-) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; 14] {
+) -> [smithay::backend::renderer::vulkan::CustomUniform<'static>; BLEND_UNIFORM_COUNT] {
     use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
 
     [
