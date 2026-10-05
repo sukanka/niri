@@ -2868,49 +2868,32 @@ impl Niri {
     pub fn refresh_color_management(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_color_management");
 
-        // Resolve config, HDR capabilities and active fullscreen state once per output,
-        // instead of repeating these lookups for every window in every dispatch cycle.
-        let outputs: Vec<_> = self
-            .global_space
-            .outputs()
-            .map(|output| {
-                let blend = self.output_blend_description(output);
-                let (preferred, fullscreen) = self.preferred_output_description(output);
-                (output.clone(), blend, preferred, fullscreen)
-            })
-            .collect();
-        for (output, desc, _, _) in &outputs {
-            let Some(state) = self.output_state.get_mut(output) else {
-                continue;
-            };
-            if state.blend_description != Some(*desc) {
-                state.blend_description = Some(*desc);
-                self.color_management_state
-                    .output_description_changed(output);
-            }
-        }
+        // Resolve descriptions once per output and visit its windows directly, avoiding a
+        // temporary output table and a linear output search for each window.
+        for output in self.global_space.outputs() {
+            let blend = self.output_blend_description(output);
+            let (preferred, fullscreen) = self.preferred_output_description(output);
 
-        for (monitor, window) in self.layout.windows() {
-            let Some(output) = monitor.map(|mon| mon.output()) else {
-                continue;
-            };
-            let Some((_, _, preferred, fullscreen)) =
-                outputs.iter().find(|(out, ..)| out == output)
-            else {
-                continue;
-            };
-            let desc = if fullscreen.is_none_or(|id| id == window.id().get()) {
-                *preferred
-            } else {
-                ImageDescription::SRGB
-            };
-            self.color_management_state
-                .preferred_changed(window.toplevel().wl_surface(), desc);
-        }
-        for (output, blend, ..) in &outputs {
+            if let Some(state) = self.output_state.get_mut(output) {
+                if state.blend_description != Some(blend) {
+                    state.blend_description = Some(blend);
+                    self.color_management_state
+                        .output_description_changed(output);
+                }
+            }
+
+            for window in self.layout.windows_for_output(output) {
+                let desc = if fullscreen.is_none_or(|id| id == window.id().get()) {
+                    preferred
+                } else {
+                    ImageDescription::SRGB
+                };
+                self.color_management_state
+                    .preferred_changed(window.toplevel().wl_surface(), desc);
+            }
             for layer in layer_map_for_output(output).layers() {
                 self.color_management_state
-                    .preferred_changed(layer.wl_surface(), *blend);
+                    .preferred_changed(layer.wl_surface(), blend);
             }
         }
     }
