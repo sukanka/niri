@@ -74,6 +74,8 @@ struct ExtWorkspaceGroupData {
 struct WrappedManager(ExtWorkspaceManagerV1);
 
 struct ExtWorkspaceData {
+    /// Whether this workspace is still present in the layout during refresh.
+    live: bool,
     // id cannot change once set.
     id: Option<String>,
     name: String,
@@ -95,14 +97,17 @@ pub fn refresh(state: &mut State) {
     let mut changed = false;
 
     // Remove workspaces that no longer exist (sending workspace_leave to workspace groups).
-    let mut seen_workspaces = HashMap::new();
-    for (mon, _, ws) in state.niri.layout.workspaces() {
-        let output = mon.map(|mon| mon.output());
-        seen_workspaces.insert(ws.id(), output);
+    for workspace in protocol_state.workspaces.values_mut() {
+        workspace.live = false;
+    }
+    for (_, _, ws) in state.niri.layout.workspaces() {
+        if let Some(workspace) = protocol_state.workspaces.get_mut(&ws.id()) {
+            workspace.live = true;
+        }
     }
 
-    protocol_state.workspaces.retain(|id, workspace| {
-        if seen_workspaces.contains_key(id) {
+    protocol_state.workspaces.retain(|_, workspace| {
+        if workspace.live {
             return true;
         }
 
@@ -383,6 +388,7 @@ fn refresh_workspace(
         Entry::Vacant(entry) => {
             // New workspace, start tracking it.
             let mut data = ExtWorkspaceData {
+                live: true,
                 id: ws.name().cloned(),
                 name: build_name(ws, ws_idx),
                 coordinates: ArrayVec::from([0, ws_idx as u32]),
