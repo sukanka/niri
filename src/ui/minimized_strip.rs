@@ -65,6 +65,10 @@ pub fn thumbnail_geometry(niri: &Niri, output: &Output) -> Vec<ThumbnailGeo> {
         .map(|mapped| (mapped.id(), mapped.size().to_f64()))
         .collect();
 
+    if windows.is_empty() {
+        return Vec::new();
+    }
+
     layout_thumbnails(
         &windows,
         config,
@@ -184,12 +188,10 @@ pub fn render_output<R: NiriRenderer>(
 
     // Render element lists are front-to-back: whatever is pushed first ends up on top. So all
     // thumbnails go in first, and the backdrops follow to sit behind them.
+    // Geometry preserves minimized-window order, so search each window at most once.
+    let mut windows = niri.layout.minimized_windows();
     for thumb in &thumbs {
-        let Some(mapped) = niri
-            .layout
-            .minimized_windows()
-            .find(|mapped| mapped.id() == thumb.id)
-        else {
+        let Some(mapped) = windows.find(|mapped| mapped.id() == thumb.id) else {
             continue;
         };
 
