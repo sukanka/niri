@@ -1,5 +1,6 @@
 //! Output damage caused by ordinary pointer motion.
 
+use smallvec::SmallVec;
 use smithay::desktop::utils::bbox_from_surface_tree;
 use smithay::desktop::LayerSurface;
 use smithay::input::pointer::CursorImageStatus;
@@ -18,7 +19,8 @@ pub(super) fn displayed_position(niri: &Niri) -> Option<Point<f64, Logical>> {
 }
 
 pub(super) struct MotionRedraw {
-    outputs: Vec<Output>,
+    // Ordinary motion touches few outputs; large cursors and monitor walls can spill safely.
+    outputs: SmallVec<[Output; 4]>,
     position: Option<Point<f64, Logical>>,
     image: CursorImageStatus,
     focus: Option<MappedId>,
@@ -30,12 +32,12 @@ pub(super) struct MotionRedraw {
 impl MotionRedraw {
     pub fn new(niri: &Niri, position: Option<Point<f64, Logical>>) -> Self {
         let all_outputs = needs_all_outputs(niri);
+        let mut outputs = SmallVec::new();
+        if !all_outputs {
+            add_overlapping_outputs(niri, position, &mut outputs);
+        }
         Self {
-            outputs: if all_outputs {
-                Vec::new()
-            } else {
-                overlapping_outputs(niri, position)
-            },
+            outputs,
             position,
             image: niri.cursor_manager.cursor_image().clone(),
             focus: niri.layout.focus().map(|window| window.id()),
@@ -63,17 +65,18 @@ impl MotionRedraw {
         {
             return;
         }
-        self.outputs.extend(overlapping_outputs(niri, position));
+        add_overlapping_outputs(niri, position, &mut self.outputs);
         // Focus-follows-mouse changes activation decoration and can scroll another output.
         if focus_changed {
-            self.outputs.extend(self.active_output);
-            self.outputs.extend(niri.layout.active_output().cloned());
+            for output in self.active_output.iter().chain(niri.layout.active_output()) {
+                if !self.outputs.contains(output) {
+                    self.outputs.push(output.clone());
+                }
+            }
         }
-        let mut queued = Vec::new();
         for output in self.outputs {
-            if !queued.contains(&output) && niri.output_state.contains_key(&output) {
+            if niri.output_state.contains_key(&output) {
                 niri.queue_redraw(&output);
-                queued.push(output);
             }
         }
     }
@@ -87,57 +90,41 @@ pub(super) fn needs_all_outputs(niri: &Niri) -> bool {
         || niri.layout.is_overview_open()
 }
 
-fn overlapping_outputs(niri: &Niri, position: Option<Point<f64, Logical>>) -> Vec<Output> {
+fn add_overlapping_outputs(
+    niri: &Niri,
+    position: Option<Point<f64, Logical>>,
+    outputs: &mut SmallVec<[Output; 4]>,
+) {
     let Some(position) = position else {
-        return Vec::new();
+        return;
     };
-    niri.global_space
-        .outputs()
-        .filter(|output| {
-            let scale = output.current_scale();
-            let bounds = match niri.cursor_manager.get_render_cursor(scale.integer_scale()) {
-                RenderCursor::Hidden => return false,
-                RenderCursor::Surface { hotspot, surface } => {
-                    let mut bounds = bbox_from_surface_tree(&surface, (0, 0)).to_f64();
-                    bounds.loc += position - hotspot.to_f64();
-                    bounds
-                }
-                RenderCursor::Named { scale, cursor, .. } => {
-                    // Include all animation frames: the old displayed frame can have a different
-                    // hotspot or size from the current frame, and both must be erased correctly.
-                    let bounds = named_bounds(
-                        cursor
-                            .frames()
-                            .iter()
-                            .map(|frame| (frame.width, frame.height, frame.xhot, frame.yhot)),
-                        f64::from(scale),
-                    );
-                    let Some(mut bounds) = bounds else {
-                        return false;
-                    };
-                    bounds.loc += position;
-                    bounds
-                }
-            };
-            let geometry = niri.global_space.output_geometry(output).unwrap().to_f64();
-            overlaps_with_rounding(bounds, geometry, scale.fractional_scale())
-        })
-        .cloned()
-        .collect()
-}
-
-fn named_bounds(
-    frames: impl Iterator<Item = (u32, u32, u32, u32)>,
-    scale: f64,
-) -> Option<Rectangle<f64, Logical>> {
-    frames
-        .map(|(width, height, xhot, yhot)| {
-            Rectangle::new(
-                Point::from((-f64::from(xhot) / scale, -f64::from(yhot) / scale)),
-                Size::from((f64::from(width) / scale, f64::from(height) / scale)),
-            )
-        })
-        .reduce(|a, b| a.merge(b))
+    for output in niri.global_space.outputs() {
+        // An output touched at the old location already needs a redraw, regardless of the
+        // new position or cursor image. Avoid computing its bounds a second time.
+        if outputs.contains(output) {
+            continue;
+        }
+        let scale = output.current_scale();
+        let bounds = match niri.cursor_manager.get_render_cursor(scale.integer_scale()) {
+            RenderCursor::Hidden => continue,
+            RenderCursor::Surface { hotspot, surface } => {
+                let mut bounds = bbox_from_surface_tree(&surface, (0, 0)).to_f64();
+                bounds.loc += position - hotspot.to_f64();
+                bounds
+            }
+            RenderCursor::Named { scale, cursor, .. } => {
+                let Some(mut bounds) = cursor.bounds(f64::from(scale)) else {
+                    continue;
+                };
+                bounds.loc += position;
+                bounds
+            }
+        };
+        let geometry = niri.global_space.output_geometry(output).unwrap().to_f64();
+        if overlaps_with_rounding(bounds, geometry, scale.fractional_scale()) {
+            outputs.push(output.clone());
+        }
+    }
 }
 
 fn overlaps_with_rounding(
@@ -156,14 +143,54 @@ fn overlaps_with_rounding(
 mod tests {
     use super::*;
 
-    #[test]
-    fn ordinary_motion_queues_old_and_new_outputs_but_overview_queues_all() {
-        use crate::niri::{RedrawState, State};
+    fn test_state(
+        output_count: u8,
+    ) -> (
+        calloop::EventLoop<'static, crate::niri::State>,
+        crate::niri::State,
+        Vec<Output>,
+    ) {
+        use crate::niri::State;
 
         let event_loop = calloop::EventLoop::try_new().unwrap();
         let display = smithay::reexports::wayland_server::Display::new().unwrap();
         let mut state = State::new(
             niri_config::Config::default(),
+            event_loop.handle(),
+            event_loop.get_signal(),
+            display,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        for number in 1..=output_count {
+            state
+                .backend
+                .headless()
+                .add_output(&mut state.niri, number, (800, 600));
+        }
+        let mut outputs: Vec<_> = state.niri.global_space.outputs().cloned().collect();
+        outputs.sort_by_key(|output| output.name());
+        (event_loop, state, outputs)
+    }
+
+    #[test]
+    #[ignore = "manual CPU microbenchmark; run with --ignored --nocapture"]
+    fn motion_redraw_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        use smithay::input::pointer::CursorIcon;
+
+        use crate::niri::State;
+
+        let event_loop = calloop::EventLoop::try_new().unwrap();
+        let display = smithay::reexports::wayland_server::Display::new().unwrap();
+        let mut config = niri_config::Config::default();
+        config.cursor.xcursor_theme = "breeze_cursors".into();
+        let mut state = State::new(
+            config,
             event_loop.handle(),
             event_loop.get_signal(),
             display,
@@ -178,8 +205,44 @@ mod tests {
                 .headless()
                 .add_output(&mut state.niri, number, (800, 600));
         }
-        let mut outputs: Vec<_> = state.niri.global_space.outputs().cloned().collect();
-        outputs.sort_by_key(|output| output.name());
+
+        // Change the displayed location directly to time just the production damage
+        // bookkeeping, excluding input dispatch, hit testing, and rendering.
+        const ITERATIONS: u32 = 50_000;
+        for icon in [CursorIcon::Default, CursorIcon::Wait] {
+            state
+                .niri
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(icon));
+            let RenderCursor::Named { cursor, .. } = state.niri.cursor_manager.get_render_cursor(1)
+            else {
+                unreachable!();
+            };
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    state.niri.tablet_cursor_location = Some((200., 200.).into());
+                    let redraw = MotionRedraw::new(&state.niri, displayed_position(&state.niri));
+                    state.niri.tablet_cursor_location = Some((201., 200.).into());
+                    black_box(redraw).queue(black_box(&mut state.niri));
+                }
+                samples.push(start.elapsed().as_nanos() / u128::from(ITERATIONS));
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "motion-redraw {icon:?} frames={} median={} ns/event samples={samples:?}",
+                cursor.frames().len(),
+                samples[3]
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_motion_queues_old_and_new_outputs_but_overview_queues_all() {
+        use crate::niri::RedrawState;
+
+        let (_event_loop, mut state, outputs) = test_state(3);
         let position = |niri: &Niri, output: &Output| {
             niri.global_space
                 .output_geometry(output)
@@ -190,6 +253,7 @@ mod tests {
         };
         state.move_cursor(position(&state.niri, &outputs[0]));
         let redraw = MotionRedraw::new(&state.niri, displayed_position(&state.niri));
+        assert!(!redraw.outputs.spilled());
         state.move_cursor(position(&state.niri, &outputs[1]));
         for output in state.niri.output_state.values_mut() {
             output.redraw_state = RedrawState::Idle;
@@ -209,10 +273,55 @@ mod tests {
     }
 
     #[test]
-    fn animated_cursor_bounds_include_old_hotspot_and_scale() {
-        let bounds = named_bounds([(32, 32, 0, 0), (64, 48, 32, 16)].into_iter(), 2.).unwrap();
-        assert_eq!(bounds.loc, Point::from((-16., -8.)));
-        assert_eq!(bounds.size, Size::from((32., 24.)));
+    fn large_overlap_spills_without_losing_or_duplicating_outputs() {
+        use crate::niri::RedrawState;
+
+        let (_event_loop, mut state, outputs) = test_state(8);
+        // Mirrored outputs all intersect the cursor, exceeding the inline capacity.
+        for output in &outputs {
+            state.niri.global_space.map_output(output, (0, 0));
+        }
+        state.move_cursor((200., 200.).into());
+        let mut redraw = MotionRedraw::new(&state.niri, displayed_position(&state.niri));
+        assert!(redraw.outputs.spilled());
+        assert_eq!(redraw.outputs.len(), outputs.len());
+        add_overlapping_outputs(&state.niri, Some((201., 200.).into()), &mut redraw.outputs);
+        assert_eq!(redraw.outputs.len(), outputs.len());
+        state.move_cursor((201., 200.).into());
+        for output in state.niri.output_state.values_mut() {
+            output.redraw_state = RedrawState::Idle;
+        }
+        redraw.queue(&mut state.niri);
+        assert!(outputs.iter().all(|output| state.niri.is_queued(output)));
+    }
+
+    #[test]
+    fn cursor_image_changes_redraw_without_pointer_motion() {
+        use crate::niri::RedrawState;
+
+        let (_event_loop, mut state, outputs) = test_state(2);
+        let position = state
+            .niri
+            .global_space
+            .output_geometry(&outputs[0])
+            .unwrap()
+            .loc
+            .to_f64()
+            + Point::from((200., 200.));
+        state.move_cursor(position);
+        for image in [
+            CursorImageStatus::Hidden,
+            CursorImageStatus::default_named(),
+        ] {
+            let redraw = MotionRedraw::new(&state.niri, displayed_position(&state.niri));
+            state.niri.cursor_manager.set_cursor_image(image);
+            for output in state.niri.output_state.values_mut() {
+                output.redraw_state = RedrawState::Idle;
+            }
+            redraw.queue(&mut state.niri);
+            assert!(state.niri.is_queued(&outputs[0]));
+            assert!(!state.niri.is_queued(&outputs[1]));
+        }
     }
 
     #[test]

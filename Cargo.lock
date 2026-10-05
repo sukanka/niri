@@ -2275,6 +2275,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "serde_json",
+ "smallvec",
  "smithay",
  "smithay-drm-extras",
  "tracing",

@@ -10,7 +10,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{IsAlive, Logical, Physical, Point, Transform};
+use smithay::utils::{IsAlive, Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use xcursor::parser::{parse_xcursor, Image};
 use xcursor::CursorTheme;
@@ -178,12 +178,7 @@ impl CursorManager {
 
         images.retain(move |image| image.width == width && image.height == height);
 
-        let animation_duration = images.iter().fold(0, |acc, image| acc + image.delay);
-
-        Ok(XCursor {
-            images,
-            animation_duration,
-        })
+        Ok(XCursor::new(images))
     }
 
     /// Set the common XCURSOR env variables.
@@ -204,10 +199,7 @@ impl CursorManager {
             pixels_argb: vec![],
         }];
 
-        XCursor {
-            images,
-            animation_duration: 0,
-        }
+        XCursor::new(images)
     }
 }
 
@@ -275,9 +267,34 @@ pub struct XCursor {
     images: Vec<Image>,
     /// The total duration of the animation.
     animation_duration: u32,
+    /// Union of all frames relative to their hotspots, before applying the output scale.
+    bounds: Option<Rectangle<f64, Physical>>,
 }
 
 impl XCursor {
+    fn new(images: Vec<Image>) -> Self {
+        let animation_duration = images.iter().map(|image| image.delay).sum();
+        let bounds = images
+            .iter()
+            .map(|image| {
+                Rectangle::new(
+                    Point::from((-f64::from(image.xhot), -f64::from(image.yhot))),
+                    Size::from((f64::from(image.width), f64::from(image.height))),
+                )
+            })
+            .reduce(|a, b| a.merge(b));
+        Self {
+            images,
+            animation_duration,
+            bounds,
+        }
+    }
+
+    /// Bounds of every animation frame, so moving the cursor also erases the old frame.
+    pub fn bounds(&self, scale: f64) -> Option<Rectangle<f64, Logical>> {
+        self.bounds.map(|bounds| bounds.to_logical(scale))
+    }
+
     /// Given a time, calculate which frame to show, and how much time remains until the next frame.
     ///
     /// Time will wrap, so if for instance the cursor has an animation lasting 100ms,
@@ -314,5 +331,74 @@ impl XCursor {
     /// Get hotspot for the given `image`.
     pub fn hotspot(image: &Image) -> Point<i32, Physical> {
         (image.xhot as i32, image.yhot as i32).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: u32, height: u32, xhot: u32, yhot: u32) -> Image {
+        Image {
+            size: width,
+            width,
+            height,
+            xhot,
+            yhot,
+            delay: 20,
+            pixels_rgba: Vec::new(),
+            pixels_argb: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cached_bounds_include_all_frame_hotspots_and_output_scale() {
+        let cursor = XCursor::new(vec![image(32, 32, 0, 0), image(64, 48, 32, 16)]);
+        let bounds = cursor.bounds(2.).unwrap();
+        assert_eq!(bounds.loc, Point::from((-16., -8.)));
+        assert_eq!(bounds.size, Size::from((32., 24.)));
+
+        // Compare with the original per-frame computation at different output scales.
+        for scale in [1., 1.25, 2., 3.] {
+            let expected = cursor
+                .frames()
+                .iter()
+                .map(|image| {
+                    Rectangle::<f64, Logical>::new(
+                        Point::from((
+                            -f64::from(image.xhot) / scale,
+                            -f64::from(image.yhot) / scale,
+                        )),
+                        Size::from((
+                            f64::from(image.width) / scale,
+                            f64::from(image.height) / scale,
+                        )),
+                    )
+                })
+                .reduce(|a, b| a.merge(b))
+                .unwrap();
+            let actual = cursor.bounds(scale).unwrap();
+            for (actual, expected) in [
+                (actual.loc.x, expected.loc.x),
+                (actual.loc.y, expected.loc.y),
+                (actual.size.w, expected.size.w),
+                (actual.size.h, expected.size.h),
+            ] {
+                assert!((actual - expected).abs() < 1e-10);
+            }
+        }
+        assert!(XCursor::new(Vec::new()).bounds(1.).is_none());
+    }
+
+    #[test]
+    fn cached_bounds_do_not_change_frame_selection() {
+        let cursor = XCursor::new(vec![image(16, 16, 1, 1), image(32, 32, 8, 8)]);
+        assert_eq!(cursor.frame(0).0, 0);
+        assert_eq!(cursor.frame(19).0, 0);
+        assert_eq!(cursor.frame(20).0, 1);
+        assert_eq!(cursor.frame(39).0, 1);
+        assert_eq!(cursor.frame(40).0, 0);
+        assert!(cursor.is_animated_cursor());
+        assert_eq!(CursorManager::fallback_cursor().frame(1000).0, 0);
     }
 }
