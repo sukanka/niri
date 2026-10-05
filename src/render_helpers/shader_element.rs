@@ -3,6 +3,7 @@ use std::ffi::CString;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
+use smallvec::SmallVec;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
     ffi, link_program, Capability, GlesError, GlesFrame, GlesRenderer, Uniform, UniformDesc,
@@ -615,8 +616,10 @@ impl ShaderRenderElement {
 
         let _span = tracy_client::span!("ShaderRenderElement::draw_vulkan");
 
-        let mut textures: Vec<(&str, &smithay::backend::renderer::vulkan::VulkanTexture)> =
-            Vec::with_capacity(self.textures.len());
+        // Current shaders use at most two textures; retain heap spill for larger programs.
+        let mut textures: SmallVec<
+            [(&str, &smithay::backend::renderer::vulkan::VulkanTexture); 2],
+        > = SmallVec::with_capacity(self.textures.len());
         for (name, texture) in &self.textures {
             let TtyOffscreen::Vulkan(texture) = texture else {
                 return Ok(());
@@ -635,7 +638,8 @@ impl ShaderRenderElement {
             return Ok(());
         };
 
-        let mut uniforms: Vec<CustomUniform<'_>> = self
+        // Fit the shader-specific values plus size, scale and the shared blend uniforms.
+        let mut uniforms: SmallVec<[CustomUniform<'_>; 32]> = self
             .additional_uniforms
             .iter()
             .filter_map(uniform_to_custom)
