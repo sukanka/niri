@@ -53,6 +53,8 @@ pub trait ForeignToplevelHandler {
 
 struct ToplevelData {
     identifier: MappedId,
+    /// Marked from the layout before removing entries, avoiding a layout search per entry.
+    live: bool,
     title: Option<String>,
     app_id: Option<String>,
     states: ArrayVec<u32, 4>,
@@ -99,9 +101,23 @@ pub fn refresh(state: &mut State) {
 
     let protocol_state = &mut state.niri.foreign_toplevel_state;
 
+    // Find live root surfaces in one layout traversal. Searching the complete layout for
+    // every tracked toplevel makes unchanged refreshes quadratic in the window count.
+    for data in protocol_state.toplevels.values_mut() {
+        data.live = false;
+    }
+    for (_, window) in state.niri.layout.windows() {
+        if let Some(data) = protocol_state
+            .toplevels
+            .get_mut(window.toplevel().wl_surface())
+        {
+            data.live = true;
+        }
+    }
+
     // Handle closed windows.
-    protocol_state.toplevels.retain(|surface, data| {
-        if state.niri.layout.find_window_and_output(surface).is_some() {
+    protocol_state.toplevels.retain(|_, data| {
+        if data.live {
             return true;
         }
 
@@ -301,6 +317,7 @@ fn refresh_toplevel(
             // New window, start tracking it.
             let mut data = ToplevelData {
                 identifier,
+                live: true,
                 title: role.title.clone(),
                 app_id: role.app_id.clone(),
                 states,
@@ -643,4 +660,102 @@ fn to_state_vec(
     }
 
     rv
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use crate::tests::Fixture;
+
+    fn map_windows(f: &mut Fixture, count: usize) -> Vec<WlSurface> {
+        let client = f.add_client();
+        for _ in 0..count {
+            let window = f.client(client).create_window();
+            let surface = window.surface.clone();
+            window.commit();
+            f.double_roundtrip(client);
+            let window = f.client(client).window(&surface);
+            window.attach_new_buffer();
+            window.ack_last_and_commit();
+            f.double_roundtrip(client);
+        }
+        f.niri_complete_animations();
+        f.niri()
+            .layout
+            .windows()
+            .map(|(_, window)| window.toplevel().wl_surface().clone())
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)] // WlSurface hashes and compares by stable resource identity.
+    fn refresh_keeps_minimized_and_unplugged_windows_and_removes_unmapped() {
+        let mut f = Fixture::new();
+        f.add_output(1, (800, 600));
+        let surfaces = map_windows(&mut f, 3);
+        let ids: Vec<_> = surfaces
+            .iter()
+            .map(|surface| {
+                f.niri()
+                    .layout
+                    .find_window_and_output(surface)
+                    .unwrap()
+                    .0
+                    .window
+                    .clone()
+            })
+            .collect();
+
+        f.niri().layout.minimize_window(&ids[0]);
+        refresh(f.niri_state());
+        let data = &f.niri().foreign_toplevel_state.toplevels[&surfaces[0]];
+        assert!(data.output.is_none());
+        assert!(data
+            .states
+            .contains(&(zwlr_foreign_toplevel_handle_v1::State::Minimized as u32)));
+
+        let output = f.niri_output(1);
+        f.niri().layout.remove_output(&output);
+        for _ in 0..3 {
+            refresh(f.niri_state());
+            let tracked = &f.niri().foreign_toplevel_state.toplevels;
+            assert_eq!(tracked.len(), 3);
+            assert!(tracked.values().all(|data| data.output.is_none()));
+        }
+
+        f.niri()
+            .layout
+            .remove_window(&ids[1], crate::utils::transaction::Transaction::new())
+            .unwrap();
+        refresh(f.niri_state());
+        let tracked = &f.niri().foreign_toplevel_state.toplevels;
+        assert_eq!(tracked.len(), 2);
+        assert!(!tracked.contains_key(&surfaces[1]));
+        assert!(tracked.contains_key(&surfaces[0]));
+        assert!(tracked.contains_key(&surfaces[2]));
+    }
+
+    /// Manual CPU bookkeeping benchmark; this excludes rendering and is not an FPS estimate.
+    #[test]
+    #[ignore]
+    fn benchmark_unchanged_toplevel_refresh() {
+        for count in [8, 32, 128] {
+            let mut f = Fixture::new();
+            f.add_output(1, (800, 600));
+            let _surfaces = map_windows(&mut f, count);
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for _ in 0..1000 {
+                    refresh(std::hint::black_box(f.niri_state()));
+                }
+                samples.push(start.elapsed().as_nanos() / 1000);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "unchanged toplevel refresh: windows={count}, median={} ns/refresh",
+                samples[2]
+            );
+        }
+    }
 }
