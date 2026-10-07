@@ -25,6 +25,7 @@ use smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::client:
     zwp_confined_pointer_v1::ZwpConfinedPointerV1,
 };
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
+use smithay::reexports::wayland_protocols::wp::presentation_time::client::wp_presentation::WpPresentation;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
@@ -87,6 +88,7 @@ pub struct State {
     pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
     pub subcompositor: Option<WlSubcompositor>,
+    pub presentation: Option<WpPresentation>,
     pub decoration_manager: Option<ZxdgDecorationManagerV1>,
     pub color_manager: Option<WpColorManagerV1>,
     /// Feedback objects kept alive so preferred_changed events can arrive.
@@ -241,6 +243,7 @@ impl Client {
             shm: None,
             viewporter: None,
             subcompositor: None,
+            presentation: None,
             decoration_manager: None,
             color_manager: None,
             surface_feedbacks: Vec::new(),
@@ -895,6 +898,8 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WlSubcompositor::interface().name {
                     let version = min(version, WlSubcompositor::interface().version);
                     state.subcompositor = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WpPresentation::interface().name {
+                    state.presentation = Some(registry.bind(name, 1, qh, ()));
                 } else if interface == ZxdgDecorationManagerV1::interface().name {
                     let version = min(version, ZxdgDecorationManagerV1::interface().version);
                     state.decoration_manager = Some(registry.bind(name, version, qh, ()));
@@ -979,6 +984,18 @@ impl Dispatch<WlSubsurface, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<WpPresentation, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpPresentation,
+        _event: <WpPresentation as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
     }
 }
 

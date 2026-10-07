@@ -18,6 +18,7 @@ use niri_config::{Config, OutputName};
 use smithay::backend::renderer::utils::{
     with_renderer_surface_state, RendererSurfaceStateUserData,
 };
+use smithay::desktop::utils::with_surfaces_surface_tree;
 use smithay::input::pointer::CursorIcon;
 use smithay::output::{self, Output};
 use smithay::reexports::rustix::time::{clock_gettime, ClockId};
@@ -30,6 +31,7 @@ use smithay::wayland::compositor::{
     get_parent, send_surface_state, with_states, SubsurfaceCachedState, SurfaceData,
 };
 use smithay::wayland::fractional_scale::with_fractional_scale;
+use smithay::wayland::presentation::PresentationFeedbackCachedState;
 use smithay::wayland::shell::xdg::{
     ToplevelCachedState, ToplevelConfigure, ToplevelState, ToplevelSurface, XdgToplevelSurfaceData,
     XdgToplevelSurfaceRoleAttributes,
@@ -263,6 +265,29 @@ pub fn ipc_transform_to_smithay(transform: niri_ipc::Transform) -> Transform {
 pub fn is_mapped(surface: &WlSurface) -> bool {
     // None if the surface hadn't committed yet.
     with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
+}
+
+/// Discards feedback for content that can no longer be presented after its window unmaps.
+pub fn discard_presentation_feedback_surface_tree(surface: &WlSurface) {
+    if !surface.is_alive() {
+        return;
+    }
+
+    with_surfaces_surface_tree(surface, |_, states| {
+        // Feedback already taken by a submitted frame belongs to that frame. Only discard
+        // committed callbacks still cached on the surface; pending callbacks belong to a
+        // future commit, possibly remapping the window.
+        let callbacks = std::mem::take(
+            &mut states
+                .cached_state
+                .get::<PresentationFeedbackCachedState>()
+                .current()
+                .callbacks,
+        );
+        for callback in callbacks {
+            callback.discarded();
+        }
+    });
 }
 
 pub fn send_scale_transform(

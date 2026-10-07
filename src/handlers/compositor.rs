@@ -23,7 +23,7 @@ use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
-use crate::utils::{is_mapped, send_scale_transform};
+use crate::utils::{discard_presentation_feedback_surface_tree, is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
 
 impl CompositorHandler for State {
@@ -285,6 +285,8 @@ impl CompositorHandler for State {
                     //
                     // Test client: wleird-unmap.
                     trace!("toplevel got unmapped");
+
+                    discard_presentation_feedback_surface_tree(surface);
 
                     let active_window = self.niri.layout.focus().map(|m| &m.window);
                     let was_active = active_window == Some(&window);

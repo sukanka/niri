@@ -12,6 +12,7 @@ mod fullscreen;
 mod layer_shell;
 mod locking;
 mod multigpu_sync;
+mod presentation;
 mod remove_output;
 mod render_status;
 mod scanout_color;

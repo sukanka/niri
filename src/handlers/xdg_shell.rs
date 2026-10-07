@@ -40,7 +40,8 @@ use crate::layout::ActivateWindow;
 use crate::niri::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
+    discard_presentation_feedback_surface_tree, get_monotonic_time, output_matches_name,
+    send_scale_transform, update_tiled_state, ResizeEdge,
 };
 use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, WindowRef};
 
@@ -899,6 +900,8 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        discard_presentation_feedback_surface_tree(surface.wl_surface());
+
         if self
             .niri
             .unmapped_windows
