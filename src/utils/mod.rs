@@ -277,13 +277,14 @@ pub fn discard_presentation_feedback_surface_tree(surface: &WlSurface) {
         // Feedback already taken by a submitted frame belongs to that frame. Only discard
         // committed callbacks still cached on the surface; pending callbacks belong to a
         // future commit, possibly remapping the window.
-        let callbacks = std::mem::take(
-            &mut states
-                .cached_state
-                .get::<PresentationFeedbackCachedState>()
-                .current()
-                .callbacks,
-        );
+        // A committed update may still be queued behind an acquire fence, FIFO barrier,
+        // or commit timer. Retire its feedback without applying the buffered content.
+        let callbacks: Vec<_> = states
+            .cached_state
+            .get::<PresentationFeedbackCachedState>()
+            .committed_iter_mut()
+            .flat_map(|committed| std::mem::take(&mut committed.callbacks))
+            .collect();
         for callback in callbacks {
             callback.discarded();
         }
