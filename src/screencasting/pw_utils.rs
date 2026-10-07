@@ -68,6 +68,8 @@ use render::RenderCache;
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const DEVICE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FENCE_POLL_DELAY: Duration = Duration::from_millis(50);
+const DMA_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_DMA_RETRIES: u32 = 3;
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
 
@@ -183,9 +185,16 @@ pub struct PipeWire {
 }
 
 pub enum PwToNiri {
-    StopCast { session_id: CastSessionId },
-    Redraw { stream_id: CastStreamId },
-    FallbackToShm { stream_id: CastStreamId },
+    StopCast {
+        session_id: CastSessionId,
+    },
+    Redraw {
+        stream_id: CastStreamId,
+    },
+    FallbackToShm {
+        stream_id: CastStreamId,
+        retry_dma: bool,
+    },
     FatalError,
 }
 
@@ -203,6 +212,8 @@ pub struct Cast {
     pub device_node: Option<DrmNode>,
     device_change: Option<DeviceChange>,
     device_change_watchdog: Option<RegistrationToken>,
+    dma_retry: Option<RegistrationToken>,
+    dma_retry_count: u32,
     changing_device: Rc<Cell<bool>>,
     offer_alpha: bool,
     cursor_mode: CursorMode,
@@ -561,8 +572,11 @@ impl PipeWire {
             }
         };
         let to_niri_ = self.to_niri.clone();
-        let fallback_to_shm = move || {
-            if let Err(err) = to_niri_.send(PwToNiri::FallbackToShm { stream_id }) {
+        let fallback_to_shm = move |retry_dma| {
+            if let Err(err) = to_niri_.send(PwToNiri::FallbackToShm {
+                stream_id,
+                retry_dma,
+            }) {
                 warn!("error sending FallbackToShm to niri: {err:?}");
             }
         };
@@ -787,7 +801,7 @@ impl PipeWire {
                                 Ok(x) => x,
                                 Err(err) => {
                                     warn!("couldn't find preferred modifier, trying SHM: {err:?}");
-                                    fallback_to_shm();
+                                    fallback_to_shm(false);
                                     return;
                                 }
                             };
@@ -899,7 +913,7 @@ impl PipeWire {
                                     Ok(x) => x,
                                     Err(err) => {
                                         warn!("test allocation failed, trying SHM: {err:?}");
-                                        fallback_to_shm();
+                                        fallback_to_shm(false);
                                         return;
                                     }
                                 };
@@ -1060,7 +1074,7 @@ impl PipeWire {
                         Err(err) => {
                             warn!("error adding pw buffer: {err:?}");
                             if allocator.gbm.is_some() {
-                                fallback_to_shm();
+                                fallback_to_shm(true);
                             } else {
                                 stop_cast();
                             }
@@ -1119,6 +1133,8 @@ impl PipeWire {
             device_node: device.node,
             device_change: None,
             device_change_watchdog: None,
+            dma_retry: None,
+            dma_retry_count: 0,
             changing_device,
             offer_alpha: alpha,
             cursor_mode,
@@ -1146,13 +1162,19 @@ impl Cast {
 
     pub fn set_device(&mut self, device: CastDevice) -> anyhow::Result<()> {
         self.remove_device_change_watchdog();
+        if let Some(token) = self.dma_retry.take() {
+            self.event_loop.remove(token);
+        }
+        if self.device_node != device.node {
+            self.dma_retry_count = 0;
+        }
         self.device_node = device.node;
         self.device_change = Some(DeviceChange::WaitingForFrames(device));
         self.changing_device.set(true);
         self.progress_device_change()
     }
 
-    pub fn fallback_to_shm(&mut self) -> anyhow::Result<()> {
+    pub fn fallback_to_shm(&mut self, retry_dma: bool) -> anyhow::Result<()> {
         // Several add_buffer callbacks can report the same allocation failure.
         if matches!(
             &self.device_change,
@@ -1162,10 +1184,62 @@ impl Cast {
         {
             return Ok(());
         }
+        let retry_device = if retry_dma && self.dma_retry_count < MAX_DMA_RETRIES {
+            let allocator = self.allocator.borrow();
+            allocator.gbm.as_ref().map(|device| CastDevice {
+                node: self.device_node,
+                gbm: Some(CastGbm {
+                    device: device.clone(),
+                    formats: allocator.formats.clone(),
+                    render_on_primary: self.render_on_primary,
+                }),
+            })
+        } else {
+            None
+        };
         self.set_device(CastDevice {
             node: self.device_node,
             gbm: None,
-        })
+        })?;
+        if let Some(device) = retry_device {
+            self.schedule_dma_retry(device);
+        }
+        Ok(())
+    }
+
+    fn schedule_dma_retry(&mut self, device: CastDevice) {
+        let stream_id = self.stream_id;
+        let delay = DMA_RETRY_DELAY * (1 << self.dma_retry_count);
+        self.dma_retry_count += 1;
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                let Some(cast) = state
+                    .niri
+                    .casting
+                    .casts
+                    .iter_mut()
+                    .find(|cast| cast.stream_id == stream_id)
+                else {
+                    return TimeoutAction::Drop;
+                };
+                // Do not interrupt retirement of the old buffers, including unfinished writes.
+                if cast.device_change.is_some() {
+                    return TimeoutAction::ToDuration(delay);
+                }
+                cast.dma_retry = None;
+                let session_id = cast.session_id;
+                debug!(%stream_id, "retrying screencast DMA allocation after runtime failure");
+                if let Err(err) = cast.set_device(device.clone()) {
+                    warn!(%stream_id, "error retrying screencast GPU: {err:?}");
+                    state.niri.stop_cast(session_id);
+                } else {
+                    state.redraw_cast(stream_id);
+                }
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.dma_retry = Some(token);
     }
 
     /// Retire the old GPU's buffers through SHM before advertising the new allocator.
@@ -1703,6 +1777,7 @@ impl Cast {
                     if (*(*spa_buffer).datas).type_ == DataType::DmaBuf.as_raw() {
                         let _ = self.to_niri.send(PwToNiri::FallbackToShm {
                             stream_id: self.stream_id,
+                            retry_dma: true,
                         });
                     }
                     return_unused_buffer(&self.stream, pw_buffer);
@@ -1768,6 +1843,7 @@ impl Cast {
                     if (*(*spa_buffer).datas).type_ == DataType::DmaBuf.as_raw() {
                         let _ = self.to_niri.send(PwToNiri::FallbackToShm {
                             stream_id: self.stream_id,
+                            retry_dma: true,
                         });
                     }
                     return_unused_buffer(&self.stream, pw_buffer);
@@ -1783,6 +1859,7 @@ impl Drop for Cast {
         for token in [
             self.scheduled_redraw.take(),
             self.device_change_watchdog.take(),
+            self.dma_retry.take(),
         ]
         .into_iter()
         .flatten()

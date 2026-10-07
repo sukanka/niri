@@ -254,7 +254,10 @@ impl State {
         match msg {
             PwToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
             PwToNiri::Redraw { stream_id } => self.redraw_cast(stream_id),
-            PwToNiri::FallbackToShm { stream_id } => {
+            PwToNiri::FallbackToShm {
+                stream_id,
+                retry_dma,
+            } => {
                 let mut to_stop = None;
                 if let Some(cast) = self
                     .niri
@@ -263,7 +266,7 @@ impl State {
                     .iter_mut()
                     .find(|cast| cast.stream_id == stream_id)
                 {
-                    if let Err(err) = cast.fallback_to_shm() {
+                    if let Err(err) = cast.fallback_to_shm(retry_dma) {
                         warn!("error falling back to SHM screencast: {err:?}");
                         to_stop = Some(cast.session_id);
                     }
