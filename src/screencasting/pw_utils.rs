@@ -220,6 +220,7 @@ pub struct Cast {
     last_frame_time: Duration,
     last_frame_interval: Duration,
     scheduled_redraw: Option<RegistrationToken>,
+    cursor_retry: Option<RegistrationToken>,
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
@@ -300,9 +301,9 @@ impl PendingFrame {
         self.damaged || self.cursor_damaged || self.last_cursor_location != cursor_location
     }
 
-    fn submitted(&mut self, cursor_location: Option<Point<i32, Physical>>) {
+    fn submitted(&mut self, cursor_location: Option<Point<i32, Physical>>, cursor_updated: bool) {
         self.damaged = false;
-        self.cursor_damaged = false;
+        self.cursor_damaged = !cursor_updated;
         self.last_cursor_location = cursor_location;
     }
 }
@@ -1141,6 +1142,7 @@ impl PipeWire {
             last_frame_time: Duration::ZERO,
             last_frame_interval: Duration::ZERO,
             scheduled_redraw: None,
+            cursor_retry: None,
             sequence_counter: 0,
             inner,
             waiting_for_buffer,
@@ -1493,6 +1495,36 @@ impl Cast {
         }
     }
 
+    fn schedule_cursor_retry(&mut self) {
+        if self.cursor_retry.is_some() {
+            return;
+        }
+        let stream_id = self.stream_id;
+        let delay = self
+            .inner
+            .borrow()
+            .min_time_between_frames
+            .max(Duration::from_millis(16));
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                let Some(cast) = state
+                    .niri
+                    .casting
+                    .casts
+                    .iter_mut()
+                    .find(|cast| cast.stream_id == stream_id)
+                else {
+                    return TimeoutAction::Drop;
+                };
+                cast.cursor_retry = None;
+                state.redraw_cast(stream_id);
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.cursor_retry = Some(token);
+    }
+
     /// Checks whether this frame should be skipped because it's too soon.
     ///
     /// If the frame should be skipped, schedules a redraw and returns `true`. Otherwise, removes a
@@ -1720,9 +1752,8 @@ impl Cast {
         unsafe {
             let spa_buffer = (*buffer).buffer;
 
-            if self.cursor_mode == CursorMode::Metadata {
-                add_cursor_metadata(renderer, spa_buffer, cursor_data, redraw_cursor);
-            }
+            let cursor_updated = self.cursor_mode != CursorMode::Metadata
+                || add_cursor_metadata(renderer, spa_buffer, cursor_data, redraw_cursor);
 
             // Every submitted buffer still contains a complete image, including for consumers
             // that cannot handle metadata-only frames. Reused buffers only redraw their damage.
@@ -1759,9 +1790,18 @@ impl Cast {
                 let CastState::Ready { pending_frame, .. } = &mut inner.state else {
                     unreachable!()
                 };
-                pending_frame.submitted(cursor_location);
+                pending_frame.submitted(cursor_location, cursor_updated);
             }
             drop(inner);
+            if res.is_ok() {
+                if cursor_updated {
+                    if let Some(token) = self.cursor_retry.take() {
+                        self.event_loop.remove(token);
+                    }
+                } else {
+                    self.schedule_cursor_retry();
+                }
+            }
             match res {
                 Ok((sync_point, buf)) => {
                     if self.sequence_counter == 0 {
@@ -1858,6 +1898,7 @@ impl Drop for Cast {
     fn drop(&mut self) {
         for token in [
             self.scheduled_redraw.take(),
+            self.cursor_retry.take(),
             self.device_change_watchdog.take(),
             self.dma_retry.take(),
         ]
@@ -2355,7 +2396,7 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
     spa_buffer: *mut spa_buffer,
     cursor_data: &CursorData<impl RenderElement<R>>,
     redraw: bool,
-) {
+) -> bool {
     unsafe {
         let cursor_meta_ptr: *mut spa_meta_cursor = spa_buffer_find_meta_data(
             spa_buffer,
@@ -2364,7 +2405,7 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
         )
         .cast();
         let Some(cursor_meta) = cursor_meta_ptr.as_mut() else {
-            return;
+            return true;
         };
 
         cursor_meta.id = 1;
@@ -2376,7 +2417,7 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
         if !redraw {
             trace!("cursor not damaged, skipping rerendering");
             cursor_meta.bitmap_offset = 0;
-            return;
+            return true;
         }
 
         cursor_meta.bitmap_offset = BITMAP_META_OFFSET as _;
@@ -2403,7 +2444,7 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
         );
         if size.w == 0 || size.h == 0 {
             trace!("cursor is invisible, skipping rendering");
-            return;
+            return true;
         }
 
         let _span = tracy_client::span!("add_cursor_metadata render cursor");
@@ -2426,14 +2467,14 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
             Ok(mapping) => mapping,
             Err(err) => {
                 warn!("error rendering cursor: {err:?}");
-                return;
+                return false;
             }
         };
         let pixels = match renderer.map_texture(&mapping) {
             Ok(pixels) => pixels,
             Err(err) => {
                 warn!("error mapping cursor texture: {err:?}");
-                return;
+                return false;
             }
         };
 
@@ -2443,6 +2484,7 @@ unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
         bitmap_meta.size.width = size.w as _;
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
+        true
     }
 }
 
@@ -2556,7 +2598,7 @@ mod tests {
     fn backpressure_preserves_final_content_and_cursor_bitmap() {
         let mut frame = PendingFrame::default();
         let location = Some(Point::from((50, 60)));
-        frame.submitted(location);
+        frame.submitted(location, true);
 
         // The damage trackers see a single change, but the consumer owns all buffers.
         assert!(frame.update(true, true, location));
@@ -2566,7 +2608,11 @@ mod tests {
             assert!(frame.update(false, false, location));
             assert!(frame.cursor_damaged);
         }
-        frame.submitted(location);
+        // Main content can succeed while downloading the cursor bitmap fails.
+        frame.submitted(location, false);
+        assert!(frame.update(false, false, location));
+        assert!(frame.cursor_damaged);
+        frame.submitted(location, true);
         assert!(!frame.update(false, false, location));
     }
 
@@ -2575,12 +2621,12 @@ mod tests {
         let mut frame = PendingFrame::default();
         let initial = Some(Point::from((50, 60)));
         let moved = Some(Point::from((80, 90)));
-        frame.submitted(initial);
+        frame.submitted(initial, true);
         assert!(frame.update(false, false, moved));
         assert!(frame.update(false, false, moved));
         assert_eq!(frame.last_cursor_location, initial);
         assert!(!frame.cursor_damaged);
-        frame.submitted(moved);
+        frame.submitted(moved, true);
         assert!(!frame.update(false, false, moved));
     }
 
