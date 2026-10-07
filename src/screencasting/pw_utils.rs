@@ -6,7 +6,7 @@ use std::iter::zip;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{mem, slice};
 
 use anyhow::{bail, ensure, Context as _};
@@ -66,6 +66,8 @@ use render::RenderCache;
 
 // Give a 0.1 ms allowance for presentation time errors.
 const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
+const DEVICE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FENCE_POLL_DELAY: Duration = Duration::from_millis(50);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
 
@@ -200,6 +202,7 @@ pub struct Cast {
     allocator: Rc<RefCell<CastAllocator>>,
     pub device_node: Option<DrmNode>,
     device_change: Option<DeviceChange>,
+    device_change_watchdog: Option<RegistrationToken>,
     changing_device: Rc<Cell<bool>>,
     offer_alpha: bool,
     cursor_mode: CursorMode,
@@ -1115,6 +1118,7 @@ impl PipeWire {
             allocator,
             device_node: device.node,
             device_change: None,
+            device_change_watchdog: None,
             changing_device,
             offer_alpha: alpha,
             cursor_mode,
@@ -1141,6 +1145,7 @@ impl Cast {
     }
 
     pub fn set_device(&mut self, device: CastDevice) -> anyhow::Result<()> {
+        self.remove_device_change_watchdog();
         self.device_node = device.node;
         self.device_change = Some(DeviceChange::WaitingForFrames(device));
         self.changing_device.set(true);
@@ -1149,7 +1154,12 @@ impl Cast {
 
     pub fn fallback_to_shm(&mut self) -> anyhow::Result<()> {
         // Several add_buffer callbacks can report the same allocation failure.
-        if self.allocator.borrow().gbm.is_none() && self.device_change.is_none() {
+        if matches!(
+            &self.device_change,
+            Some(DeviceChange::WaitingForFrames(CastDevice { gbm: None, .. }))
+                | Some(DeviceChange::WaitingForShm(CastDevice { gbm: None, .. }))
+        ) || (self.allocator.borrow().gbm.is_none() && self.device_change.is_none())
+        {
             return Ok(());
         }
         self.set_device(CastDevice {
@@ -1180,15 +1190,51 @@ impl Cast {
             DeviceChangeStep::NegotiateShm => {
                 *self.allocator.borrow_mut() = CastAllocator::default();
                 self.device_change = Some(DeviceChange::WaitingForShm(change.into_device()));
+                self.start_device_change_watchdog();
                 return self.renegotiate_device(true);
             }
             DeviceChangeStep::Install => (),
         }
+        self.remove_device_change_watchdog();
         let device = change.into_device();
         self.changing_device.set(false);
         self.render_on_primary = device.gbm.as_ref().is_some_and(|gbm| gbm.render_on_primary);
         *self.allocator.borrow_mut() = CastAllocator::from(device.gbm);
         self.renegotiate_device(false)
+    }
+
+    fn start_device_change_watchdog(&mut self) {
+        let stream_id = self.stream_id;
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_duration(DEVICE_CHANGE_TIMEOUT), move |_, _, state| {
+                let Some(cast) = state
+                    .niri
+                    .casting
+                    .casts
+                    .iter_mut()
+                    .find(|cast| cast.stream_id == stream_id)
+                else {
+                    return TimeoutAction::Drop;
+                };
+                cast.device_change_watchdog = None;
+                if matches!(cast.device_change, Some(DeviceChange::WaitingForShm(_))) {
+                    // GPU writes were drained before SHM negotiation. It is safe to
+                    // disconnect here, but not to force-install over the old DMA buffers.
+                    warn!(%stream_id, "screencast GPU renegotiation timed out, stopping session");
+                    let session_id = cast.session_id;
+                    state.niri.stop_cast(session_id);
+                }
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.device_change_watchdog = Some(token);
+    }
+
+    fn remove_device_change_watchdog(&mut self) {
+        if let Some(token) = self.device_change_watchdog.take() {
+            self.event_loop.remove(token);
+        }
     }
 
     fn renegotiate_device(&mut self, retire_dma: bool) -> anyhow::Result<()> {
@@ -1440,6 +1486,7 @@ impl Cast {
         // Export can fail while the GPU is still writing. Preserve that dependency; in
         // particular, a device migration must never mistake it for a completed buffer.
         let needs_poll = sync_fd.is_none() && !sync_point.is_reached();
+        let poll_sync = needs_poll.then(|| sync_point.clone());
 
         inner.rendering_buffers.push((pw_buffer, sync_point));
         drop(inner);
@@ -1447,9 +1494,11 @@ impl Cast {
         match sync_fd {
             None => {
                 self.queue_completed_buffers();
-                if needs_poll {
+                if let Some(poll_sync) = poll_sync {
                     let stream_id = self.stream_id;
-                    let delay = Duration::from_millis(1);
+                    let mut delay = Duration::from_millis(1);
+                    let started = Instant::now();
+                    let mut warned = false;
                     self.event_loop
                         .insert_source(Timer::from_duration(delay), move |_, _, state| {
                             let Some(cast) = state
@@ -1461,14 +1510,16 @@ impl Cast {
                             else {
                                 return TimeoutAction::Drop;
                             };
+                            // Check this fence before draining: completion between the two
+                            // checks must not drop its last wakeup with a buffer still queued.
+                            let completed = poll_sync.is_reached();
                             cast.queue_completed_buffers();
-                            if cast
-                                .inner
-                                .borrow()
-                                .rendering_buffers
-                                .iter()
-                                .any(|(buffer, _)| *buffer == pw_buffer)
-                            {
+                            if !completed {
+                                if !warned && started.elapsed() >= DEVICE_CHANGE_TIMEOUT {
+                                    warn!(%stream_id, "screencast GPU completion stalled; retaining buffer until its fence signals");
+                                    warned = true;
+                                }
+                                delay = (delay * 2).min(MAX_FENCE_POLL_DELAY);
                                 TimeoutAction::ToDuration(delay)
                             } else {
                                 TimeoutAction::Drop
@@ -1723,6 +1774,20 @@ impl Cast {
                     false
                 }
             }
+        }
+    }
+}
+
+impl Drop for Cast {
+    fn drop(&mut self) {
+        for token in [
+            self.scheduled_redraw.take(),
+            self.device_change_watchdog.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.event_loop.remove(token);
         }
     }
 }
