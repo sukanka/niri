@@ -79,6 +79,9 @@ fn region_rectangles(
     };
     let mut rectangles = Vec::new();
     for (kind, rectangle) in &region.rects {
+        if rectangle.size.w <= 0 || rectangle.size.h <= 0 {
+            continue;
+        }
         // Convert before adding coordinates, so even client rectangles near i32::MAX cannot
         // overflow while clipping them to the surface.
         let Some(rectangle) = bounds.intersection(rectangle.to_f64()) else {
