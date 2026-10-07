@@ -1,13 +1,17 @@
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
 use niri_ipc::PositionChange;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::desktop::utils::with_surfaces_surface_tree;
 use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource};
+use smithay::utils::{Monotonic, Time};
 use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::commit_timing::Timestamp;
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, remove_pre_commit_hook,
     with_states, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
@@ -23,7 +27,9 @@ use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
-use crate::utils::{discard_presentation_feedback_surface_tree, is_mapped, send_scale_transform};
+use crate::utils::{
+    discard_presentation_feedback_surface_tree, get_monotonic_time, is_mapped, send_scale_transform,
+};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
 
 impl CompositorHandler for State {
@@ -40,6 +46,12 @@ impl CompositorHandler for State {
         while let Some(parent) = get_parent(&root) {
             root = parent;
         }
+
+        // Reparenting changes the root before the next surface commit. Update descendants too,
+        // so removing the previous window won't retire feedback belonging to the new window.
+        with_surfaces_surface_tree(surface, |surface, _| {
+            self.niri.root_surface.insert(surface.clone(), root.clone());
+        });
 
         if let Some(output) = self.niri.output_for_root(&root) {
             let scale = output.current_scale();
@@ -286,7 +298,7 @@ impl CompositorHandler for State {
                     // Test client: wleird-unmap.
                     trace!("toplevel got unmapped");
 
-                    discard_presentation_feedback_surface_tree(surface);
+                    self.discard_window_presentation_feedback(surface);
 
                     let active_window = self.niri.layout.focus().map(|m| &m.window);
                     let was_active = active_window == Some(&window);
@@ -483,6 +495,8 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        self.discard_window_presentation_feedback(surface);
+
         // Clients may destroy their subsurfaces before the main surface. Ensure we have a snapshot
         // when that happens, so that the closing animation includes all these subsurfaces.
         //
@@ -528,6 +542,56 @@ impl ShmHandler for State {
 }
 
 impl State {
+    pub(super) fn discard_window_presentation_feedback(&mut self, root: &WlSurface) {
+        // Wine detaches its Vulkan subsurface before destroying the window, but keeps its
+        // wl_surface alive until swapchain teardown. The current tree no longer contains it.
+        let mut surfaces: Vec<_> = self
+            .niri
+            .root_surface
+            .iter()
+            .filter(|(_, cached_root)| *cached_root == root)
+            .map(|(surface, _)| surface.clone())
+            .collect();
+        if !surfaces.contains(root) {
+            surfaces.push(root.clone());
+        }
+        surfaces.retain(Resource::is_alive);
+
+        let display_handle = self.niri.display_handle.clone();
+        loop {
+            let mut clients = HashMap::new();
+            let target: Timestamp = Time::<Monotonic>::from(get_monotonic_time()).into();
+            let mut next_deadline = None;
+            for surface in &surfaces {
+                with_states(surface, |states| {
+                    // A detached surface will no longer reach the output's pacing traversal.
+                    // Release presentation-only barriers so queued feedback reaches current state.
+                    Self::signal_fifo_surface(surface, states, &mut clients);
+                    Self::signal_commit_timing_surface(
+                        surface,
+                        states,
+                        target,
+                        &mut next_deadline,
+                        &mut clients,
+                    );
+                });
+            }
+
+            let advanced = !clients.is_empty();
+            for client in clients.into_values() {
+                self.client_compositor_state(&client)
+                    .blocker_cleared(self, &display_handle);
+            }
+            for surface in &surfaces {
+                discard_presentation_feedback_surface_tree(surface);
+            }
+            // Applying one queued commit can expose the next FIFO barrier in its chain.
+            if !advanced {
+                break;
+            }
+        }
+    }
+
     pub fn add_default_dmabuf_pre_commit_hook(&mut self, surface: &WlSurface) {
         if !surface.is_alive() {
             error!("tried to add dmabuf pre-commit hook for a dead surface");

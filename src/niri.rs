@@ -1145,7 +1145,7 @@ impl State {
         min_next_deadline.map(|timestamp| Time::<Monotonic>::from(timestamp).into())
     }
 
-    fn signal_commit_timing_surface(
+    pub(crate) fn signal_commit_timing_surface(
         surface: &WlSurface,
         states: &SurfaceData,
         target: Timestamp,
@@ -1201,7 +1201,7 @@ impl State {
         }
     }
 
-    fn signal_fifo_surface(
+    pub(crate) fn signal_fifo_surface(
         surface: &WlSurface,
         states: &SurfaceData,
         clients: &mut HashMap<ClientId, Client>,

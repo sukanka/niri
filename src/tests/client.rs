@@ -26,6 +26,10 @@ use smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::client:
 };
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::wp_presentation::WpPresentation;
+use smithay::reexports::wayland_protocols::wp::fifo::v1::client::wp_fifo_manager_v1::WpFifoManagerV1;
+use smithay::reexports::wayland_protocols::wp::fifo::v1::client::wp_fifo_v1::WpFifoV1;
+use smithay::reexports::wayland_protocols::wp::commit_timing::v1::client::wp_commit_timing_manager_v1::WpCommitTimingManagerV1;
+use smithay::reexports::wayland_protocols::wp::commit_timing::v1::client::wp_commit_timer_v1::WpCommitTimerV1;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
@@ -89,6 +93,8 @@ pub struct State {
     pub viewporter: Option<WpViewporter>,
     pub subcompositor: Option<WlSubcompositor>,
     pub presentation: Option<WpPresentation>,
+    pub fifo_manager: Option<WpFifoManagerV1>,
+    pub commit_timing_manager: Option<WpCommitTimingManagerV1>,
     pub decoration_manager: Option<ZxdgDecorationManagerV1>,
     pub color_manager: Option<WpColorManagerV1>,
     /// Feedback objects kept alive so preferred_changed events can arrive.
@@ -244,6 +250,8 @@ impl Client {
             viewporter: None,
             subcompositor: None,
             presentation: None,
+            fifo_manager: None,
+            commit_timing_manager: None,
             decoration_manager: None,
             color_manager: None,
             surface_feedbacks: Vec::new(),
@@ -307,6 +315,13 @@ impl Client {
     /// Creates a subsurface of `parent` with a buffer attached and committed, like winewayland does
     /// for Vulkan swapchain presentation. Returns the subsurface's wl_surface.
     pub fn create_committed_subsurface(&mut self, parent: &WlSurface) -> WlSurface {
+        self.create_committed_subsurface_with_role(parent).0
+    }
+
+    pub fn create_committed_subsurface_with_role(
+        &mut self,
+        parent: &WlSurface,
+    ) -> (WlSurface, WlSubsurface) {
         let compositor = self.state.compositor.as_ref().unwrap();
         let subcompositor = self
             .state
@@ -316,13 +331,13 @@ impl Client {
         let spbm = self.state.spbm.as_ref().unwrap();
 
         let surface = compositor.create_surface(&self.qh, ());
-        let _subsurface = subcompositor.get_subsurface(&surface, parent, &self.qh, ());
+        let subsurface = subcompositor.get_subsurface(&surface, parent, &self.qh, ());
         let buffer = spbm.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &self.qh, ());
         surface.attach(Some(&buffer), 0, 0);
         surface.commit();
         parent.commit();
         self.connection.flush().unwrap();
-        surface
+        (surface, subsurface)
     }
 
     /// Drives the color-management requests an HDR-aware client (SDL3) sends at startup: create a
@@ -900,6 +915,10 @@ impl Dispatch<WlRegistry, ()> for State {
                     state.subcompositor = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpPresentation::interface().name {
                     state.presentation = Some(registry.bind(name, 1, qh, ()));
+                } else if interface == WpFifoManagerV1::interface().name {
+                    state.fifo_manager = Some(registry.bind(name, 1, qh, ()));
+                } else if interface == WpCommitTimingManagerV1::interface().name {
+                    state.commit_timing_manager = Some(registry.bind(name, 1, qh, ()));
                 } else if interface == ZxdgDecorationManagerV1::interface().name {
                     let version = min(version, ZxdgDecorationManagerV1::interface().version);
                     state.decoration_manager = Some(registry.bind(name, version, qh, ()));
@@ -992,6 +1011,54 @@ impl Dispatch<WpPresentation, ()> for State {
         _state: &mut Self,
         _proxy: &WpPresentation,
         _event: <WpPresentation as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpFifoManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFifoManagerV1,
+        _event: <WpFifoManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpFifoV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFifoV1,
+        _event: <WpFifoV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpCommitTimingManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpCommitTimingManagerV1,
+        _event: <WpCommitTimingManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpCommitTimerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpCommitTimerV1,
+        _event: <WpCommitTimerV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
