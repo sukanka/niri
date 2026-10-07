@@ -53,6 +53,16 @@ Finally, you may want to auto-install some of the applications bound in niri's [
 
 ### Running tests
 
+When using the local Smithay checkout, enable `renderer_vulkan` explicitly to include its
+renderer tests; Smithay's default features only enable the Vulkan backend. On a host with
+compatible hardware or software renderers, require both renderers so unavailable devices
+cannot silently skip the rendering checks:
+
+```sh
+SMITHAY_TEST_REQUIRE_GLES=1 SMITHAY_TEST_REQUIRE_VULKAN=1 \
+    cargo test --manifest-path ../smithay/Cargo.toml -p smithay --lib --features renderer_vulkan
+```
+
 A successful build alone does not verify cross-GPU buffer synchronization.
 For the per-output renderer, also run the hardware regression test with two accessible DRM render devices:
 

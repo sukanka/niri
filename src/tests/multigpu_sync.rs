@@ -19,6 +19,7 @@ use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::{ffi, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::GpuManager;
+use smithay::backend::renderer::utils::Buffer as WaylandBuffer;
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportDmaWl, Offscreen, Renderer,
 };
@@ -29,9 +30,6 @@ use smithay::utils::{Buffer, DeviceFd, Physical, Rectangle, Transform};
 use smithay::wayland::compositor::with_states;
 
 use super::Fixture;
-use crate::render_helpers::dmabuf_sync::{
-    import_read_fence, wait_for_read_completion, with_read_fence,
-};
 
 type Api = GbmGlesBackend<GlesRenderer, DeviceFd>;
 
@@ -45,7 +43,7 @@ enum ImportPath {
 enum SyncAction {
     None,
     ExportOnly,
-    ReadFence,
+    Tracked,
     Wait,
 }
 
@@ -57,7 +55,7 @@ struct Outcome {
     mismatched_frames: usize,
     mismatched_pixels: usize,
     direct_imports: usize,
-    published_read_fences: usize,
+    tracked_frames: usize,
     elapsed_ms: u128,
 }
 
@@ -247,7 +245,7 @@ fn run_case(
         mismatched_frames: 0,
         mismatched_pixels: 0,
         direct_imports: 0,
-        published_read_fences: 0,
+        tracked_frames: 0,
         elapsed_ms: 0,
     };
     let mut pending: Vec<(usize, GlesTexture)> = Vec::new();
@@ -260,9 +258,17 @@ fn run_case(
         } else {
             top_damage
         };
-        let texture = with_states(&surface, |states| {
-            consumer.import_dma_buffer(&wl_buffers[slot], Some(states), &[damage])
-        })?;
+        let read_source = WaylandBuffer::with_implicit(wl_buffers[slot].clone());
+        let mut import = || {
+            with_states(&surface, |states| {
+                consumer.import_dma_buffer(&wl_buffers[slot], Some(states), &[damage])
+            })
+        };
+        let texture = if sync_action == SyncAction::Tracked {
+            read_source.with_read_source(import)
+        } else {
+            import()
+        }?;
         outcome.direct_imports += usize::from(buffers[slot].node() == Some(target_node));
         if index < 3 {
             eprintln!("import case={path:?} serial={serial} slot={slot} selected={:?} source={source_node} target={target_node}", buffers[slot].node());
@@ -275,20 +281,26 @@ fn run_case(
             let mut frame =
                 consumer.render(&mut framebuffer, (size, size).into(), Transform::Normal)?;
             frame.clear(Color32F::TRANSPARENT, &[full])?;
-            // Bounded overdraw increases overlap with the next AMD update without a busy
-            // shader, unbounded GPU loop, global stall, or any display/KMS operation.
-            for _ in 0..repeats {
-                frame.render_texture_from_to(
-                    &texture,
-                    Rectangle::from_size((size, size).into()).to_f64(),
-                    full,
-                    &[full],
-                    &[],
-                    Transform::Normal,
-                    1.,
-                )?;
+            let draw = || {
+                // Bounded overdraw increases overlap with the next AMD update.
+                for _ in 0..repeats {
+                    frame.render_texture_from_to(
+                        &texture,
+                        Rectangle::from_size((size, size).into()).to_f64(),
+                        full,
+                        &[full],
+                        &[],
+                        Transform::Normal,
+                        1.,
+                    )?;
+                }
+                frame.finish()
+            };
+            if sync_action == SyncAction::Tracked {
+                read_source.with_read_source(draw)?
+            } else {
+                draw()?
             }
-            frame.finish()?
         };
         match sync_action {
             SyncAction::None => {}
@@ -297,12 +309,9 @@ fn run_case(
                     .export()
                     .context("NVIDIA renderer cannot export native fence")?;
             }
-            SyncAction::ReadFence => with_read_fence(&sync, |fence| {
-                import_read_fence(&buffers[slot], fence)?;
-                outcome.published_read_fences += 1;
-                Ok(())
-            }),
-            SyncAction::Wait => wait_for_read_completion(&sync),
+            // The actual import/draw submissions publish their own read dependencies.
+            SyncAction::Tracked => outcome.tracked_frames += 1,
+            SyncAction::Wait => while sync.wait().is_err() {},
         }
         pending.push((index, target));
         if pending.len() == batch_size || index + 1 == frames {
@@ -395,14 +404,14 @@ fn cross_gpu_client_buffer_reuse() -> anyhow::Result<()> {
         for sync_action in [
             SyncAction::None,
             SyncAction::ExportOnly,
-            SyncAction::ReadFence,
+            SyncAction::Tracked,
             SyncAction::Wait,
         ] {
             // The shadow-only case also guards the lower-level consumer-fence handoff;
             // publishing a fence to the client buffer can incidentally mask that race.
             let shadow_regression =
                 matches!(path, ImportPath::SourceHint) && sync_action == SyncAction::None;
-            if !diagnostic && sync_action != SyncAction::ReadFence && !shadow_regression {
+            if !diagnostic && sync_action != SyncAction::Tracked && !shadow_regression {
                 continue;
             }
             let outcome = run_case(
@@ -416,9 +425,9 @@ fn cross_gpu_client_buffer_reuse() -> anyhow::Result<()> {
                 false,
             )?;
             // Unsynchronized direct imports are a negative control, not production behavior.
-            // DMA shadows must be safe even without the compositor's client-buffer bridge.
+            // DMA shadows must be safe even without an explicit Wayland read scope.
             let must_match = outcome.direct_imports == 0
-                || matches!(sync_action, SyncAction::ReadFence | SyncAction::Wait);
+                || matches!(sync_action, SyncAction::Tracked | SyncAction::Wait);
             if must_match && outcome.mismatched_frames != 0 {
                 failed.push((outcome.path, outcome.sync_action, outcome.mismatched_frames));
             }
