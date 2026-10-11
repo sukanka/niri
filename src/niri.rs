@@ -136,7 +136,9 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, Headless, OutputHdrCaps, RenderResult, Tty, Winit};
+use crate::backend::{
+    Backend, Headless, OutputColorState, OutputHdrCaps, RenderResult, Tty, Winit,
+};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -2767,12 +2769,42 @@ impl Niri {
         }
     }
 
+    /// Construct the description for the blend space actually used by a backend frame.
+    ///
+    /// The backend supplies `hdr_active` from its accepted/staged connector state, independently
+    /// of the configured preference. If disabling HDR fails, the old HDR state can remain active
+    /// even after the HDR configuration has been removed.
+    pub(crate) fn output_description_for_blend(
+        &self,
+        output: &Output,
+        hdr_active: bool,
+    ) -> ImageDescription {
+        if !hdr_active {
+            return ImageDescription::SRGB;
+        }
+        let caps = output
+            .user_data()
+            .get::<OutputHdrCaps>()
+            .copied()
+            .unwrap_or_default();
+        let hdr = output
+            .user_data()
+            .get::<OutputName>()
+            .and_then(|name| self.config.borrow().outputs.find(name)?.hdr.clone())
+            .unwrap_or_default();
+        let caps = caps.with_peak_luminance(hdr.peak_luminance.map(|v| v.0));
+        Self::hdr_blend_description(&hdr, caps)
+    }
+
     /// The image description describing how this output is presented (its blend space).
     ///
-    /// With `hdr mode="on"`, an HDR-capable output always reports its PQ/BT.2020 description.
-    /// In auto mode it reports PQ only while HDR is actually engaged (fullscreen HDR content),
-    /// so clients are never told the output is in HDR before the connector is.
+    /// Hardware backends publish the last successfully committed frame's description, so a
+    /// rejected HDR request cannot advertise PQ while SDR is still being presented. Headless
+    /// and other backends without explicit state retain the configured blend-space model.
     pub fn output_blend_description(&self, output: &Output) -> ImageDescription {
+        if let Some(description) = OutputColorState::committed(output) {
+            return description;
+        }
         let Some((hdr, caps)) = self.output_hdr_config(output) else {
             return ImageDescription::SRGB;
         };

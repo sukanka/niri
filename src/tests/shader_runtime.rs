@@ -446,6 +446,180 @@ fn scene_hdr_content_draws_gles() {
     render_scene(&mut f, None).assert_drew_texture(&["texture_hdr_to_sdr"]);
 }
 
+/// Exercise the real surface shaders and read pixels back while switching the output
+/// between PQ and the SDR fallback used after a rejected HDR connector state. Reuse one
+/// renderer across the three content descriptions to catch stale gamut/tone-map uniforms.
+#[test]
+fn hdr_neutral_pixels_survive_sdr_fallback_and_blend_switches_gles() {
+    use std::io::Write as _;
+    use std::os::fd::{AsFd as _, FromRawFd as _};
+
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::drm::Curve1DType;
+    use smithay::backend::renderer::ExportMem as _;
+    use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::{
+        Primaries, RenderIntent, TransferFunction,
+    };
+    use smithay::reexports::wayland_server::protocol::wl_shm as server_shm;
+    use smithay::utils::Transform;
+    use smithay::wayland::color::management::get_surface_description;
+    use wayland_client::protocol::wl_shm;
+
+    use crate::render_helpers::blend::{BlendSurfaceRenderElement, ContentColor};
+
+    let Some(mut renderer) = gpu::gles_renderer() else {
+        return;
+    };
+
+    for kind in ["PQ", "scRGB", "Windows-BT2100"] {
+        let mut f = Fixture::new();
+        // Use FP16 SHM only in this fixture so that scRGB includes HDR white and
+        // highlights above 1.0, without needing a DRM device or DMA-BUF allocation.
+        f.niri()
+            .shm_state
+            .update_formats([server_shm::Format::Abgr16161616f]);
+        f.add_output(1, (100, 100));
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+
+        match kind {
+            "PQ" => f.client(id).create_and_attach_hdr_description(
+                &surface,
+                TransferFunction::St2084Pq,
+                Primaries::Bt2020,
+                RenderIntent::Perceptual,
+            ),
+            "scRGB" => f.client(id).create_and_attach_scrgb_description(&surface),
+            _ => f.client(id).create_and_attach_bt2100_description(&surface),
+        }
+
+        // Exactly representable FP16 samples. The corresponding scRGB luminances
+        // reach 640 nits; PQ samples include the range below and above SDR white.
+        let (half, levels): ([u16; 8], [f64; 8]) = if kind == "scRGB" {
+            (
+                [0, 0x2800, 0x3000, 0x3800, 0x3c00, 0x4100, 0x4400, 0x4800],
+                [0., 0.03125, 0.125, 0.5, 1., 2.5, 4., 8.],
+            )
+        } else {
+            (
+                [0, 0x3000, 0x3400, 0x3600, 0x3800, 0x3900, 0x3a00, 0x3c00],
+                [0., 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1.],
+            )
+        };
+        let pixels = half
+            .into_iter()
+            .flat_map(|value| [value, value, value, 0x3c00])
+            .flat_map(u16::to_ne_bytes)
+            .collect::<Vec<_>>();
+        let fd = unsafe { libc::memfd_create(c"niri-test-hdr-gray".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(&pixels).unwrap();
+        let client = f.client(id);
+        let pool = client.state.shm.as_ref().unwrap().create_pool(
+            file.as_fd(),
+            pixels.len() as i32,
+            &client.qh,
+            (),
+        );
+        let buffer = pool.create_buffer(0, 8, 1, 64, wl_shm::Format::Abgr16161616f, &client.qh, ());
+        pool.destroy();
+        let window = client.window(&surface);
+        window.set_size(8, 1);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, 8, 1);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+
+        let server_surface = f
+            .niri()
+            .layout
+            .focus()
+            .unwrap()
+            .toplevel()
+            .wl_surface()
+            .clone();
+        let inner = with_states(&server_surface, |states| {
+            WaylandSurfaceRenderElement::from_surface(
+                &mut renderer,
+                &server_surface,
+                states,
+                (0., 0.).into(),
+                1.,
+                Kind::Unspecified,
+            )
+            .unwrap()
+            .unwrap()
+        });
+        let content = ContentColor::from_description(get_surface_description(&server_surface).0);
+        let element = BlendSurfaceRenderElement::new(inner, content);
+        let mut renders = Vec::new();
+        for output_blend in [
+            Some((200., 600.)),
+            None,
+            Some((400., 1000.)),
+            None,
+            Some((200., 600.)),
+        ] {
+            blend::set_frame_blend(&mut renderer, output_blend);
+            let mapping = crate::render_helpers::render_and_download(
+                &mut renderer,
+                (8, 1).into(),
+                Scale::from(1.),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                std::iter::once(&element),
+            )
+            .unwrap();
+            let pixels = renderer.map_texture(&mapping).unwrap().to_vec();
+            gpu::check_gl_error(&mut renderer).unwrap();
+            let mut previous = 0;
+            for (i, rgba) in pixels.chunks_exact(4).enumerate() {
+                assert_eq!(rgba[3], 255, "{kind}, {output_blend:?}, sample {i}");
+                assert!(
+                    rgba[..3].iter().max().unwrap() - rgba[..3].iter().min().unwrap() <= 1,
+                    "non-neutral {kind}, {output_blend:?}, sample {i}: {rgba:?}"
+                );
+                assert!(
+                    rgba[0] >= previous,
+                    "gray ramp is not monotonic: {pixels:?}"
+                );
+                previous = rgba[0];
+                // Display-referred content has no tone mapping. Check its absolute
+                // response too, so a stale transform cannot pass merely by staying gray.
+                if kind != "PQ" {
+                    let linear = if kind == "scRGB" {
+                        levels[i]
+                    } else {
+                        Curve1DType::Pq125Eotf.eval(levels[i])
+                    };
+                    let expected = if let Some((reference, _)) = output_blend {
+                        Curve1DType::Pq125InvEotf.eval(linear * reference / 203.)
+                    } else {
+                        (linear * 80. / 203.).clamp(0., 1.).powf(1. / 2.2)
+                    };
+                    assert!(
+                        (f64::from(rgba[0]) - expected * 255.).abs() <= 2.,
+                        "wrong luminance for {kind}, {output_blend:?}, sample {i}: {rgba:?}, expected {expected}"
+                    );
+                }
+            }
+            assert!(pixels[0] <= 1, "black lifted: {kind}, {output_blend:?}");
+            assert!(
+                pixels[28] > 128,
+                "white not drawn: {kind}, {output_blend:?}"
+            );
+            renders.push(pixels);
+        }
+        assert_eq!(renders[0], renders[4], "HDR state not restored for {kind}");
+        assert_eq!(renders[1], renders[3], "SDR state not restored for {kind}");
+    }
+    blend::set_frame_blend(&mut renderer, None);
+}
+
 /// Renders the recent-windows (MRU) overlay, which fades window previews out with the
 /// gradient-fade shader.
 #[test]

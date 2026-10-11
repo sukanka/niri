@@ -8,6 +8,7 @@ use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::color::management::ImageDescription;
 
 use crate::niri::Niri;
 use crate::utils::id::IdCounter;
@@ -121,6 +122,32 @@ impl OutputHdrCaps {
             max_frame_avg_luminance,
             ..self
         }
+    }
+}
+
+/// The image description of the last frame successfully committed by the backend.
+///
+/// Unlike HDR capabilities and preferences, this describes accepted output state. Backends
+/// with an asynchronous or fallible commit must keep the previous value until the new frame
+/// is accepted. Backends without this entry use niri's configured blend-space model.
+#[derive(Debug)]
+pub struct OutputColorState(Mutex<ImageDescription>);
+
+impl OutputColorState {
+    pub fn committed(output: &Output) -> Option<ImageDescription> {
+        output
+            .user_data()
+            .get::<Self>()
+            .map(|state| *state.0.lock().unwrap())
+    }
+
+    /// Publish an accepted frame's description, or initialize the known output state.
+    /// Do not call this for a staged state or a successful TEST_ONLY request.
+    pub fn set_committed(output: &Output, description: ImageDescription) {
+        output
+            .user_data()
+            .insert_if_missing_threadsafe(|| Self(Mutex::new(description)));
+        *output.user_data().get::<Self>().unwrap().0.lock().unwrap() = description;
     }
 }
 

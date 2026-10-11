@@ -387,7 +387,7 @@ The optional `mode` property controls when the output is in HDR:
   leaving HDR is a modeset (expect a brief blank). With HDR10, `HDR_OUTPUT_METADATA` is taken from the
   application that engages HDR and kept until the output leaves HDR, even if other HDR content
   becomes fullscreen in between.
-- `mode="on"`: the output is always in HDR. SDR content (the desktop, windowed applications) is
+- `mode="on"`: requests HDR continuously. SDR content (the desktop, windowed applications) is
   composited into the HDR blend space, windowed HDR content displays correctly alongside it, and
   applications are told to prefer HDR upfront — use this for games that only probe HDR support once
   at startup. With HDR10, `HDR_OUTPUT_METADATA` always describes the display itself (from its EDID) and
@@ -433,6 +433,11 @@ Use `niri msg render-status` to inspect the **committed** signal. It shows `HDR 
 `HDR signal: LLDV (experimental)`; `niri msg --json render-status` reports `hdr_signal` as `hdr10`
 or `ll-dv`. This reports the connector state accepted by DRM, not just the configuration request.
 It does not verify that the display received the intended HDMI encoding or that DV images are correct.
+
+If the driver rejects an HDR change, rendering and the Wayland output image description stay with
+the accepted state; a rejected request does not make the output HDR. Color changes are tested with
+the compositor's actual framebuffer format before being committed with a frame. Applications can
+still be told to prefer HDR content, including in `mode="auto"` before fullscreen content engages it.
 
 HDR10 does not categorically disable direct scanout or the hardware cursor. Fullscreen content can
 scan out when its required color transform is supported by a plane; otherwise niri composites it.

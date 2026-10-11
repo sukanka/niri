@@ -12,7 +12,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
-use crate::backend::OutputHdrCaps;
+use crate::backend::{OutputColorState, OutputHdrCaps};
 
 /// A fixture whose config opts an output into HDR. The `wp_color_manager_v1` global is always
 /// advertised regardless; the `hdr` node only affects the descriptions niri hands out.
@@ -171,6 +171,92 @@ fn feedback_preferred_is_pq_with_mode_on() {
         assert_eq!(client.state.info_tf, Some(TransferFunction::St2084Pq));
         assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
     }
+}
+
+#[test]
+fn output_description_tracks_committed_state_independently_of_hdr_preference() {
+    use niri_config::output::HdrSignal;
+    use smithay::wayland::color::management::ImageDescription;
+
+    for signal in [HdrSignal::Hdr10, HdrSignal::LowLatencyDolbyVision] {
+        let mut f = fixture_with_hdr_mode_on();
+        f.niri().config.borrow_mut().outputs.0[0]
+            .hdr
+            .as_mut()
+            .unwrap()
+            .signal = signal;
+        let output = f.niri_output(1);
+        OutputColorState::set_committed(&output, ImageDescription::SRGB);
+
+        let id = f.add_client();
+        let surface = fullscreen_window(&mut f, id);
+
+        // Constructing an HDR frame description does not publish it. This models a
+        // rejected/queued HDR transition while the last committed output remains SDR.
+        let hdr_frame = f.niri().output_description_for_blend(&output, true);
+        f.client(id).probe_output_color_management();
+        f.double_roundtrip(id);
+        assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::Srgb));
+        assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Srgb));
+
+        // Preference remains PQ so an HDR-capable client can request HDR content even
+        // before a successful output commit. It must not follow the SDR fallback.
+        f.client(id).probe_surface_preferred(&surface);
+        f.double_roundtrip(id);
+        assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::St2084Pq));
+        assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Bt2020));
+
+        // The backend publishes only after a real commit succeeds. HDR10 and LLDV
+        // retain the same PQ/BT.2020 description on the color-management protocol.
+        OutputColorState::set_committed(&output, hdr_frame);
+        f.client(id).probe_output_color_management();
+        f.double_roundtrip(id);
+        assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::St2084Pq));
+        assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Bt2020));
+        assert_eq!(f.client(id).state.info_luminances, Some((100, 800, 203)));
+
+        // Removing HDR from the config requests SDR, but a failed disabling commit
+        // must keep reporting the previously accepted HDR description.
+        f.niri().config.borrow_mut().outputs.0[0].hdr = None;
+        let sdr_frame = f.niri().output_description_for_blend(&output, false);
+        assert_eq!(sdr_frame, ImageDescription::SRGB);
+        f.client(id).probe_output_color_management();
+        f.double_roundtrip(id);
+        assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::St2084Pq));
+        assert_eq!(f.client(id).state.info_luminances, Some((100, 800, 203)));
+
+        OutputColorState::set_committed(&output, sdr_frame);
+        f.client(id).probe_output_color_management();
+        f.double_roundtrip(id);
+        assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::Srgb));
+        assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Srgb));
+    }
+}
+
+#[test]
+fn auto_hdr_preference_can_engage_while_committed_output_is_sdr() {
+    use niri_config::output::HdrMode;
+    use smithay::wayland::color::management::ImageDescription;
+
+    let mut f = fixture_with_hdr_mode_on();
+    f.niri().config.borrow_mut().outputs.0[0]
+        .hdr
+        .as_mut()
+        .unwrap()
+        .mode = HdrMode::Auto;
+    let output = f.niri_output(1);
+    OutputColorState::set_committed(&output, ImageDescription::SRGB);
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::Srgb));
+
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::St2084Pq));
+    assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Bt2020));
 }
 
 #[test]

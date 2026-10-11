@@ -80,7 +80,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::tty_renderer::TtyGpuManager;
-use super::{override_peak_luminance, IpcOutputMap, OutputHdrCaps, RenderResult};
+use super::{override_peak_luminance, IpcOutputMap, OutputColorState, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
@@ -148,12 +148,14 @@ pub use super::tty_renderer::{TtyFrame, TtyFramebuffer, TtyRenderer};
 #[allow(dead_code)]
 pub type TtyRendererError<'render> = super::tty_renderer::TtyRendererError;
 
-type GbmDrmCompositor = DrmCompositor<
-    GbmAllocator<DeviceFd>,
-    GbmFramebufferExporter<DeviceFd>,
-    (OutputPresentationFeedback, Duration),
-    DeviceFd,
->;
+type GbmDrmCompositor =
+    DrmCompositor<GbmAllocator<DeviceFd>, GbmFramebufferExporter<DeviceFd>, FrameData, DeviceFd>;
+
+struct FrameData {
+    presentation_feedbacks: OutputPresentationFeedback,
+    target_presentation_time: Duration,
+    color_description: ImageDescription,
+}
 
 pub struct OutputDevice {
     token: RegistrationToken,
@@ -1594,16 +1596,6 @@ impl Tty {
             );
         }
 
-        // Probe formats using HDR10 first, so an LLDV rejection cannot discard an otherwise
-        // usable 10-bit format. The final signal is staged after the format probes below.
-        // Staging only issues TEST_ONLY requests; the first queued frame applies the state.
-        let color_state =
-            initial_connector_color_state(&config, hdr_supported, edid_hdr, &max_bpc_range, None);
-        let mut ll_dv_rejected = false;
-        if let Err(err) = surface.use_color_state(color_state) {
-            warn!("error staging initial connector color state: {err:?}");
-        }
-
         // Log the color pipelines (kernel drm_colorop API, Linux 6.19+) the primary plane
         // offers. The DrmCompositor discovers them for every plane on its own and resolves the
         // per-element scanout color transforms against them (see use_color_transforms), so that
@@ -1682,6 +1674,8 @@ impl Tty {
             min_luminance: edid_hdr.min_luminance,
             max_frame_avg_luminance: edid_hdr.max_frame_avg_luminance,
         });
+        // A requested or successfully tested HDR state is not yet a displayed frame.
+        OutputColorState::set_committed(&output, ImageDescription::SRGB);
         if let Some(x) = orientation {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
@@ -1973,8 +1967,24 @@ impl Tty {
             }
         }
 
+        // Validate color signalling only after selecting the compositor's framebuffer format
+        // and modifier. DrmSurface's standalone test uses an 8-bit dumb buffer, which need not
+        // be usable with the requested HDR mode even when the actual composition buffer is.
+        // Staging only issues TEST_ONLY; the first queued frame applies the color state.
+        let color_state =
+            initial_connector_color_state(&config, hdr_supported, edid_hdr, &max_bpc_range, None);
+        if let Err(err) = compositor.use_color_state(color_state) {
+            warn!(
+                connector = connector_name,
+                format = ?compositor.format(),
+                ?color_state,
+                "error staging initial connector color state: {err:?}"
+            );
+        }
+
         // Only stage LLDV after a usable 10-bit compositor has been selected. Failed LLDV
-        // validation leaves the HDR10 probe state staged for the first real frame.
+        // validation leaves the successfully tested fallback staged for the first real frame.
+        let mut ll_dv_rejected = false;
         if !HDR_TEN_BIT_COLOR_FORMATS.contains(&compositor.format()) {
             ll_dv_bpc = None;
             if hdr_signal == HdrSignal::LowLatencyDolbyVision {
@@ -1992,8 +2002,7 @@ impl Tty {
                 ll_dv_bpc,
             );
             if let Err(err) = compositor.use_color_state(final_state) {
-                ll_dv_rejected =
-                    !matches!(&err, FrameError::DrmError(err) if temporary_drm_error(err));
+                ll_dv_rejected = !temporary_color_state_error(&err);
                 warn!("error staging initial LLDV signal; retaining the fallback state: {err:?}");
             }
         }
@@ -2276,7 +2285,11 @@ impl Tty {
 
         // Mark the last frame as submitted.
         match surface.compositor.frame_submitted() {
-            Ok((mut feedback, target_presentation_time)) => {
+            Ok(FrameData {
+                presentation_feedbacks: mut feedback,
+                target_presentation_time,
+                ..
+            }) => {
                 let refresh = match refresh_interval {
                     Some(refresh) => {
                         if output_state.frame_clock.vrr() {
@@ -2320,6 +2333,10 @@ impl Tty {
                 warn!("error marking frame as submitted: {err:?}");
             }
         }
+
+        // frame_submitted() may have submitted a previously queued frame. Only its
+        // successful DRM commit may publish the associated output color description.
+        publish_committed_color_state(&output, &surface.compositor);
 
         // A gamma change deferred by the post-blend encode offload can go through once the
         // compositor has committed a frame resetting the gamma LUT.
@@ -2647,10 +2664,14 @@ impl Tty {
                         );
                     }
                     Err(err) => {
-                        let temporary =
-                            matches!(&err, FrameError::DrmError(err) if temporary_drm_error(err));
+                        let temporary = temporary_color_state_error(&err);
                         surface.failed_color_state = (!temporary).then_some(desired);
-                        warn!("failed to update HDR signalling: {err:?}");
+                        warn!(
+                            connector = surface.name.connector,
+                            format = ?surface.compositor.format(),
+                            ?desired,
+                            "failed to update HDR signalling: {err:?}"
+                        );
                         if is_ll_dv_state(desired) && !temporary {
                             surface.ll_dv_rejected = true;
                             let fallback = hdr_connector_color_state(
@@ -2663,8 +2684,7 @@ impl Tty {
                             match surface.compositor.use_color_state(fallback) {
                                 Ok(()) => surface.failed_color_state = None,
                                 Err(err) => {
-                                    let temporary = matches!(&err,
-                                        FrameError::DrmError(err) if temporary_drm_error(err));
+                                    let temporary = temporary_color_state_error(&err);
                                     surface.failed_color_state = (!temporary).then_some(fallback);
                                     warn!("failed to stage HDR10 fallback: {err:?}");
                                 }
@@ -2944,11 +2964,16 @@ impl Tty {
                 if !res.is_empty {
                     let presentation_feedbacks =
                         niri.take_presentation_feedbacks(output, &res.states);
-                    let data = (presentation_feedbacks, target_presentation_time);
+                    let data = FrameData {
+                        presentation_feedbacks,
+                        target_presentation_time,
+                        color_description: niri.output_description_for_blend(output, blend_hdr),
+                    };
                     let mut frame_status = FrameRenderStatus::new(is_direct_scanout, &res.states);
 
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
+                            publish_committed_color_state(output, drm_compositor);
                             // Read the mode accepted by DRM: an async request may fall back to
                             // VSync. Failed or empty frames must not replace this snapshot.
                             frame_status.presentation_mode = drm_compositor
@@ -4638,6 +4663,14 @@ fn is_hdr_color_state(state: ConnectorColorState) -> bool {
     state.hdr_metadata.is_some() || is_ll_dv_state(state)
 }
 
+fn publish_committed_color_state(output: &Output, compositor: &GbmDrmCompositor) {
+    // queue_frame() may only defer the new frame while another is in flight. The pending
+    // frame, unlike the queued one, has already passed the actual DRM commit.
+    if let Some(frame) = compositor.pending_frame() {
+        OutputColorState::set_committed(output, frame.user_data.color_description);
+    }
+}
+
 fn connector_hdr_signal(state: ConnectorColorState) -> Option<niri_ipc::OutputHdrSignal> {
     if is_ll_dv_state(state) {
         Some(niri_ipc::OutputHdrSignal::LowLatencyDolbyVision)
@@ -4665,6 +4698,21 @@ fn temporary_drm_error(err: &DrmError) -> bool {
     match err {
         DrmError::DeviceInactive | DrmError::DrmMasterFailed => true,
         DrmError::Access(err) => temporary_drm_access_error(err.source.kind()),
+        _ => false,
+    }
+}
+
+/// A color test may need a free composition buffer while previously queued frames are still
+/// in flight. Retry after presentation rather than caching that as an unsupported HDR signal.
+fn temporary_color_state_error<A, B, F>(err: &FrameError<A, B, F>) -> bool
+where
+    A: std::error::Error + Send + Sync + 'static,
+    B: std::error::Error + Send + Sync + 'static,
+    F: std::error::Error + Send + Sync + 'static,
+{
+    match err {
+        FrameError::NoFreeSlotsError => true,
+        FrameError::DrmError(err) => temporary_drm_error(err),
         _ => false,
     }
 }
@@ -4991,7 +5039,8 @@ mod tests {
         feedback_formats, hdr_connector_color_state, initial_connector_color_state,
         is_hdr_color_state, is_ll_dv_state, ll_dv_output_bpc,
         output_format_change_requires_recreation, presentation_mode, should_reject_ll_dv_frame,
-        temporary_drm_access_error, wants_10bit_formats, EdidHdrInfo, FrameRenderStatus,
+        temporary_color_state_error, temporary_drm_access_error, wants_10bit_formats, EdidHdrInfo,
+        FrameRenderStatus,
     };
 
     #[test]
@@ -5122,6 +5171,29 @@ mod tests {
                 io::Error::from_raw_os_error(errno).kind()
             ));
         }
+    }
+
+    #[test]
+    fn color_state_test_retries_busy_buffers_without_rejecting_the_signal() {
+        use std::io;
+
+        use smithay::backend::drm::compositor::FrameError;
+        use smithay::backend::drm::DrmError;
+
+        type Error = FrameError<io::Error, io::Error, io::Error>;
+        // Color validation uses a real swapchain buffer. Exhaustion says nothing about
+        // support for HDR10/LLDV and must allow a retry when an in-flight buffer is released.
+        assert!(temporary_color_state_error(&Error::NoFreeSlotsError));
+        assert!(temporary_color_state_error(&Error::DrmError(
+            DrmError::DeviceInactive
+        )));
+        assert!(temporary_color_state_error(&Error::DrmError(
+            DrmError::DrmMasterFailed
+        )));
+        assert!(!temporary_color_state_error(&Error::NoSupportedPlaneFormat));
+        assert!(!temporary_color_state_error(&Error::FramebufferExport(
+            io::Error::from_raw_os_error(libc::EINVAL)
+        )));
     }
 
     #[test]
