@@ -646,6 +646,13 @@ fn format_render_status(output: &OutputRenderStatus) -> String {
         yes_no_unknown(output.hdr_enabled)
     )
     .unwrap();
+    if let Some(signal) = output.hdr_signal {
+        let signal = match signal {
+            niri_ipc::OutputHdrSignal::Hdr10 => "HDR10",
+            niri_ipc::OutputHdrSignal::LowLatencyDolbyVision => "LLDV (experimental)",
+        };
+        writeln!(text, "  HDR signal: {signal}").unwrap();
+    }
 
     if let Some(frame) = &output.last_frame {
         writeln!(text, "  Last submitted DRM frame:").unwrap();
@@ -954,6 +961,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn render_status_reports_committed_hdr_signal() {
+        let mut status = OutputRenderStatus {
+            name: "HDMI-A-1".to_owned(),
+            render_node: None,
+            scanout_node: None,
+            cross_gpu_composition: None,
+            vrr_enabled: None,
+            hdr_enabled: Some(true),
+            hdr_signal: Some(niri_ipc::OutputHdrSignal::LowLatencyDolbyVision),
+            last_frame: None,
+        };
+        assert!(format_render_status(&status).contains("HDR signal: LLDV (experimental)"));
+        status.hdr_signal = Some(niri_ipc::OutputHdrSignal::Hdr10);
+        assert!(format_render_status(&status).contains("HDR signal: HDR10"));
+        assert!(!format_render_status(&status).contains("LLDV"));
+    }
+
+    #[test]
     fn render_status_unknown_text() {
         let status = OutputRenderStatus {
             name: "winit".to_owned(),
@@ -962,6 +987,7 @@ mod tests {
             cross_gpu_composition: None,
             vrr_enabled: None,
             hdr_enabled: None,
+            hdr_signal: None,
             last_frame: None,
         };
         assert_snapshot!(format_render_status(&status), @r#"
@@ -984,6 +1010,7 @@ mod tests {
             cross_gpu_composition: Some(true),
             vrr_enabled: Some(true),
             hdr_enabled: Some(false),
+            hdr_signal: None,
             last_frame: Some(niri_ipc::OutputFrameStatus {
                 direct_scanout: false,
                 presentation_mode: Some(OutputPresentationMode::Async),

@@ -1292,11 +1292,29 @@ pub struct OutputRenderStatus {
     pub vrr_enabled: Option<bool>,
     /// Whether HDR output is currently enabled, if known.
     pub hdr_enabled: Option<bool>,
+    /// HDR signalling in the currently committed connector state.
+    ///
+    /// `None` for SDR, unknown signal types, or backends without DRM state. This does not
+    /// report a requested configuration, nor certify the HDMI wire format or the image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_signal: Option<OutputHdrSignal>,
     /// The most recent frame successfully submitted to DRM.
     ///
     /// `None` before a successful submission or when the backend has no DRM frame state.
     /// The frame may precede the current configuration and need not have been presented yet.
     pub last_frame: Option<OutputFrameStatus>,
+}
+
+/// HDR signal configured on a DRM connector.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum OutputHdrSignal {
+    /// PQ with HDR10 static metadata.
+    #[serde(rename = "hdr10")]
+    Hdr10,
+    /// Experimental low-latency Dolby Vision vendor-specific signalling.
+    #[serde(rename = "ll-dv")]
+    LowLatencyDolbyVision,
 }
 
 /// Diagnostics for a frame successfully submitted to DRM.
@@ -2258,8 +2276,34 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].cross_gpu_composition, None);
         assert_eq!(outputs[0].vrr_enabled, None);
+        assert_eq!(outputs[0].hdr_signal, None);
         assert_eq!(outputs[0].last_frame, None);
         assert_eq!(serde_json::to_value(response).unwrap(), wire);
+    }
+
+    #[test]
+    fn render_status_hdr_signal_roundtrip() {
+        for (signal, name) in [
+            (OutputHdrSignal::Hdr10, "hdr10"),
+            (OutputHdrSignal::LowLatencyDolbyVision, "ll-dv"),
+        ] {
+            let status = OutputRenderStatus {
+                name: "HDMI-A-1".to_owned(),
+                render_node: None,
+                scanout_node: None,
+                cross_gpu_composition: None,
+                vrr_enabled: None,
+                hdr_enabled: Some(true),
+                hdr_signal: Some(signal),
+                last_frame: None,
+            };
+            let wire = serde_json::to_value(&status).unwrap();
+            assert_eq!(wire["hdr_signal"], name);
+            assert_eq!(
+                serde_json::from_value::<OutputRenderStatus>(wire).unwrap(),
+                status
+            );
+        }
     }
 
     #[test]
@@ -2272,6 +2316,7 @@ mod tests {
                 cross_gpu_composition: Some(true),
                 vrr_enabled: Some(true),
                 hdr_enabled: Some(false),
+                hdr_signal: None,
                 last_frame: Some(OutputFrameStatus {
                     direct_scanout: false,
                     presentation_mode: Some(mode),

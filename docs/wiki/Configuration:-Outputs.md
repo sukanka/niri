@@ -368,7 +368,7 @@ Opts this output into HDR. When present, niri:
 - advertises output color preferences through `wp-color-management-v1`, according to the
   selected HDR mode, and uses the color descriptions supplied by applications;
 - requests a 10-bit (or wider) scanout buffer, and at least 10 `max-bpc`;
-- enables BT.2020 / PQ signalling and a `HDR_OUTPUT_METADATA` infoframe while HDR is active;
+- enables BT.2020 / PQ output while HDR is active, using HDR10 static metadata by default;
 - converts content into the output blend space, with tone mapping when needed.
 
 The `wp-color-management-v1` protocol itself is always advertised; without an `hdr` node, output
@@ -384,17 +384,57 @@ The optional `mode` property controls when the output is in HDR:
   application shows HDR content (passthrough). Applications are told to prefer HDR (PQ / BT.2020)
   once they are the active fullscreen window, so clients that listen for preference changes (SDL3
   games, mpv with `--target-colorspace-hint`) switch to HDR when they go fullscreen. Entering and
-  leaving HDR is a modeset (expect a brief blank). The `HDR_OUTPUT_METADATA` is taken from the
+  leaving HDR is a modeset (expect a brief blank). With HDR10, `HDR_OUTPUT_METADATA` is taken from the
   application that engages HDR and kept until the output leaves HDR, even if other HDR content
   becomes fullscreen in between.
 - `mode="on"`: the output is always in HDR. SDR content (the desktop, windowed applications) is
   composited into the HDR blend space, windowed HDR content displays correctly alongside it, and
   applications are told to prefer HDR upfront — use this for games that only probe HDR support once
-  at startup. The `HDR_OUTPUT_METADATA` always describes the display itself (from its EDID) and
+  at startup. With HDR10, `HDR_OUTPUT_METADATA` always describes the display itself (from its EDID) and
   never changes with the content, so there is no modeset when entering or leaving fullscreen (on
   nvidia with DisplayPort, any metadata change would be one).
 
-HDR does not categorically disable direct scanout or the hardware cursor. Fullscreen content can
+The optional `signal` child selects the HDR signalling format.
+Write `signal "ll-dv"` inside the `hdr` braces, without an equals sign.
+
+- `signal "hdr10"` (the default): sends HDR10 static metadata with the existing PQ / BT.2020 output.
+- `signal "ll-dv"`: requests experimental low-latency Dolby Vision (LLDV) signalling on HDMI.
+  This requires the NVIDIA `NV_HDMI_VSIF_METADATA` connector property and a version 2 Dolby Vision
+  EDID block advertising low-latency and 4:4:4 support, in addition to the HDR capabilities above.
+  If the required capabilities are missing or the driver rejects the configuration, niri falls
+  back to HDR10 and logs the reason. A rejected LLDV configuration is retried when output
+  configuration changes or the output is recreated. Temporary errors during a VT switch or when DRM is busy
+  do not disable LLDV. Changing only `signal` updates the connector state while preserving the
+  Wayland output and its layer surfaces. The display can still briefly blank during the modeset.
+
+The LLDV option uses the existing PQ / BT.2020 rendering pipeline. It is an experiment in output
+signalling; it does not implement Dolby Vision RPU processing, enhancement-layer decoding, or
+complete Dolby Vision image processing. A Dolby Vision message on the display confirms that the
+display recognized the signal, but does not establish that Dolby Vision content is rendered correctly.
+Applications remain responsible for decoding their content and providing an appropriate color
+description to niri.
+
+LLDV tone mapping currently uses the same HDR EDID luminance data and `peak-luminance` override as
+HDR10. The target luminance parsed from the Dolby Vision EDID block is logged for diagnostics;
+it does not yet replace the renderer's tone-mapping target.
+
+When the connector exposes `max-bpc`, LLDV requests at least the advertised 4:4:4 depth (10 or
+12 bits). If the property's range cannot accommodate it, niri falls back to HDR10. Without this
+property, link negotiation remains the driver's responsibility. An EDID declaration of 12-bit
+support and the DRM `max-bpc` value do not measure the actual HDMI wire bit depth. Selecting `ll-dv`
+does not by itself guarantee 12-bit output. The option does not change driver-wide bit-depth or
+quantization settings.
+
+While LLDV is active, all content, including the cursor, is composited into one PQ / BT.2020
+output buffer. Direct scanout, overlay planes, hardware cursor planes, and
+`scanout-post-blend-encode` are disabled for this experimental path.
+
+Use `niri msg render-status` to inspect the **committed** signal. It shows `HDR signal: HDR10` or
+`HDR signal: LLDV (experimental)`; `niri msg --json render-status` reports `hdr_signal` as `hdr10`
+or `ll-dv`. This reports the connector state accepted by DRM, not just the configuration request.
+It does not verify that the display received the intended HDMI encoding or that DV images are correct.
+
+HDR10 does not categorically disable direct scanout or the hardware cursor. Fullscreen content can
 scan out when its required color transform is supported by a plane; otherwise niri composites it.
 The optional [`scanout-post-blend-encode`](./Configuration:-Debug-Options.md#scanout-post-blend-encode)
 path can also use the CRTC gamma LUT for a compatible fullscreen frame. Normal SDR cursors are
@@ -408,7 +448,7 @@ reference); raise it if the SDR desktop looks too dim next to HDR content.
 The optional `peak-luminance` child (in cd/m²) overrides the display's peak luminance from its EDID.
 Only set it for displays whose EDID doesn't provide HDR luminance data, which is common on TVs:
 without it niri assumes a conservative 500 cd/m². Use the peak brightness from the display's
-specifications. The value is used to tone map content brighter than the display, in the
+specifications. The value is used to tone map content brighter than the display, in the HDR10
 `HDR_OUTPUT_METADATA` sent to the display (max luminance and MaxCLL), and in the luminances
 advertised to applications. Setting it on a display with correct EDID data only replaces that data.
 
@@ -432,6 +472,14 @@ output "DP-1" {
 output "HDMI-A-1" {
     hdr {
         peak-luminance 800
+    }
+}
+
+// Experimental LLDV signalling on a supported NVIDIA HDMI connection.
+output "HDMI-A-1" {
+    hdr mode="on" {
+        reference-luminance 200
+        signal "ll-dv"
     }
 }
 ```

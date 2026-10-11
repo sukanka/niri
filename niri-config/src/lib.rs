@@ -1239,6 +1239,7 @@ mod tests {
                         hdr: Some(
                             Hdr {
                                 mode: On,
+                                signal: Hdr10,
                                 reference_luminance: Some(
                                     FloatOrInt(
                                         203.0,

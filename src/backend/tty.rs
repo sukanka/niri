@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, ensure, Context};
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::{HdrMode, Modeline};
+use niri_config::output::{HdrMode, HdrSignal, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
@@ -23,13 +23,13 @@ use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{
-    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement,
+    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement, RenderFrameError,
 };
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
     ColorOpKind, ColorPipeline, Colorspace, ConnectorColorState, CtaCoordinate, DrmDevice,
-    DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, Eotf, HdrOutputMetadata,
-    NodeType, VrrSupport,
+    DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, Eotf,
+    HdmiVsifMetadata, HdrOutputMetadata, NodeType, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -406,6 +406,11 @@ struct Surface {
     /// `Colorspace` (with BT2020_RGB) and `HDR_OUTPUT_METADATA` properties, and the sink's EDID
     /// advertises the PQ EOTF.
     hdr_supported: bool,
+    /// Preferred 4:4:4 bit depth from a supported DV V2 sink on an HDMI VSIF connector.
+    /// This is a capability/request, not a measurement of the HDMI link's bit depth.
+    ll_dv_bpc: Option<u32>,
+    /// Stop retrying a rejected LLDV state until output configuration changes or recreation.
+    ll_dv_rejected: bool,
     /// HDR capabilities parsed from the sink's EDID.
     edid_hdr: EdidHdrInfo,
     /// Valid range of the connector's `max bpc` property, if it has one.
@@ -1540,14 +1545,46 @@ impl Tty {
             .map(|info| EdidHdrInfo::from_edid(&info))
             .unwrap_or_default();
         let hdr_supported = supports_bt2020 && supports_hdr_metadata && edid_hdr.pq;
+        let supports_vsif = surface
+            .hdmi_vsif_supported(connector.handle())
+            .unwrap_or(false);
+        let dolby_vision = smithay_drm_extras::display_info::get_dolby_vision_info(
+            &device.drm,
+            connector.handle(),
+        );
+        let hdr_signal = config
+            .hdr
+            .as_ref()
+            .map(|hdr| hdr.signal)
+            .unwrap_or_default();
+        let mut ll_dv_bpc = ll_dv_output_bpc(
+            hdr_supported && connector.interface() == connector::Interface::HDMIA && supports_vsif,
+            dolby_vision,
+            &max_bpc_range,
+        );
+        if hdr_force_8bit(self.config.borrow().debug.disable_10bit_output) {
+            ll_dv_bpc = None;
+        }
         debug!(
             supports_bt2020,
             supports_hdr_metadata,
             edid_pq = edid_hdr.pq,
             edid_bt2020_rgb = edid_hdr.bt2020_rgb,
             ?max_bpc_range,
+            supports_vsif,
+            ?dolby_vision,
+            ?ll_dv_bpc,
             "connector color capabilities"
         );
+        if hdr_signal == HdrSignal::LowLatencyDolbyVision {
+            if ll_dv_bpc.is_none() {
+                warn!(connector = connector_name,
+                    "LLDV requires HDR, HDMI VSIF, DV V2 low-latency 4:4:4 support and a 10-bit framebuffer; falling back to HDR10");
+            } else {
+                warn!(connector = connector_name, ?ll_dv_bpc,
+                    "experimental LLDV signalling enabled; HDMI wire encoding, quantization and bit depth are not verified");
+            }
+        }
         if config.hdr.is_some() && !hdr_supported {
             warn!(
                 "output {connector_name}: hdr is enabled in the config, but the driver or \
@@ -1557,11 +1594,12 @@ impl Tty {
             );
         }
 
-        // Probe formats with the color state that the first real frame will use.
-        // Staging only issues TEST_ONLY requests; the mode and HDR state are applied
-        // together when the first frame is queued.
+        // Probe formats using HDR10 first, so an LLDV rejection cannot discard an otherwise
+        // usable 10-bit format. The final signal is staged after the format probes below.
+        // Staging only issues TEST_ONLY requests; the first queued frame applies the state.
         let color_state =
-            initial_connector_color_state(&config, hdr_supported, edid_hdr, &max_bpc_range);
+            initial_connector_color_state(&config, hdr_supported, edid_hdr, &max_bpc_range, None);
+        let mut ll_dv_rejected = false;
         if let Err(err) = surface.use_color_state(color_state) {
             warn!("error staging initial connector color state: {err:?}");
         }
@@ -1935,6 +1973,31 @@ impl Tty {
             }
         }
 
+        // Only stage LLDV after a usable 10-bit compositor has been selected. Failed LLDV
+        // validation leaves the HDR10 probe state staged for the first real frame.
+        if !HDR_TEN_BIT_COLOR_FORMATS.contains(&compositor.format()) {
+            ll_dv_bpc = None;
+            if hdr_signal == HdrSignal::LowLatencyDolbyVision {
+                warn!(
+                    connector = connector_name,
+                    "8-bit framebuffer selected; using HDR10 instead of LLDV"
+                );
+            }
+        } else if ll_dv_bpc.is_some() && hdr_signal == HdrSignal::LowLatencyDolbyVision {
+            let final_state = initial_connector_color_state(
+                &config,
+                hdr_supported,
+                edid_hdr,
+                &max_bpc_range,
+                ll_dv_bpc,
+            );
+            if let Err(err) = compositor.use_color_state(final_state) {
+                ll_dv_rejected =
+                    !matches!(&err, FrameError::DrmError(err) if temporary_drm_error(err));
+                warn!("error staging initial LLDV signal; retaining the fallback state: {err:?}");
+            }
+        }
+
         if self.debug_tint {
             compositor.set_debug_flags(DebugFlags::TINT);
         }
@@ -1985,6 +2048,8 @@ impl Tty {
             name: output_name,
             connector: connector.handle(),
             hdr_supported,
+            ll_dv_bpc,
+            ll_dv_rejected,
             edid_hdr,
             max_bpc_range,
             wants_10bit_formats,
@@ -2189,24 +2254,25 @@ impl Tty {
             return None;
         }
 
-        let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
-            state @ (RedrawState::Idle
-            | RedrawState::Queued
-            | RedrawState::WaitingForEstimatedVBlank(_)
-            | RedrawState::WaitingForEstimatedVBlankAndQueued(_)) => {
-                // This is an error!() because it shouldn't happen, but on some systems it somehow
-                // does. Kernel sending rogue vblank events?
-                //
-                // https://github.com/niri-wm/niri/issues/556
-                // https://github.com/niri-wm/niri/issues/615
-                error!(
-                    "unexpected redraw state for output {name} (should be WaitingForVBlank); \
+        let mut redraw_needed =
+            match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+                RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
+                state @ (RedrawState::Idle
+                | RedrawState::Queued
+                | RedrawState::WaitingForEstimatedVBlank(_)
+                | RedrawState::WaitingForEstimatedVBlankAndQueued(_)) => {
+                    // This is an error!() because it shouldn't happen, but on some systems it
+                    // somehow does. Kernel sending rogue vblank events?
+                    //
+                    // https://github.com/niri-wm/niri/issues/556
+                    // https://github.com/niri-wm/niri/issues/615
+                    error!(
+                        "unexpected redraw state for output {name} (should be WaitingForVBlank); \
                      can happen when resuming from sleep or powering on monitors: {state:?}"
-                );
-                true
-            }
-        };
+                    );
+                    true
+                }
+            };
 
         // Mark the last frame as submitted.
         match surface.compositor.frame_submitted() {
@@ -2247,6 +2313,9 @@ impl Tty {
             }
             Err(FrameError::EmptyFrame) => (),
             Err(err) => {
+                if let FrameError::DrmError(drm_err) = &err {
+                    redraw_needed |= reject_ll_dv_after_drm_error(surface, drm_err);
+                }
                 let err: SwapBuffersError = err.into();
                 warn!("error marking frame as submitted: {err:?}");
             }
@@ -2367,6 +2436,9 @@ impl Tty {
                 |path| path.to_string_lossy().into_owned(),
             )
         };
+        // Diagnostics describe the last committed connector state. The pending state can
+        // still fail its atomic test/commit and must not be reported as an active signal.
+        let current_color_state = surface.map(|surface| surface.compositor.current_color_state());
 
         niri_ipc::OutputRenderStatus {
             name: output.name(),
@@ -2378,13 +2450,8 @@ impl Tty {
             vrr_enabled: surface
                 .and_then(|surface| surface.last_frame_status)
                 .and_then(|frame| frame.vrr_enabled),
-            hdr_enabled: surface.map(|surface| {
-                surface
-                    .compositor
-                    .current_color_state()
-                    .hdr_metadata
-                    .is_some()
-            }),
+            hdr_enabled: current_color_state.map(is_hdr_color_state),
+            hdr_signal: current_color_state.and_then(connector_hdr_signal),
             last_frame: surface
                 .and_then(|surface| surface.last_frame_status)
                 .map(FrameRenderStatus::to_ipc),
@@ -2503,10 +2570,17 @@ impl Tty {
         // The connector state is only *staged* here; smithay applies it inside its own commit
         // as a single atomic modeset together with mode, CRTC and plane state (committing
         // connector color properties standalone hangs some drivers, notably nvidia).
-        let (blend_hdr, reference_luminance, edid_hdr) = {
+        let (blend_hdr, blend_ll_dv, reference_luminance, edid_hdr) = {
             let config = self.config.borrow();
             let output_config = config.outputs.find(&surface.name);
             let hdr_config = output_config.and_then(|o| o.hdr.clone());
+            let requested_signal = hdr_config
+                .as_ref()
+                .map(|hdr| hdr.signal)
+                .unwrap_or_default();
+            let ll_dv_bpc = (!surface.ll_dv_rejected)
+                .then_some(surface.ll_dv_bpc)
+                .flatten();
             let edid_hdr = surface.edid_hdr.with_peak_luminance(
                 hdr_config
                     .as_ref()
@@ -2530,7 +2604,7 @@ impl Tty {
                 .flatten();
             let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
 
-            let desired = if blend_hdr {
+            let hdr_metadata = if blend_hdr {
                 // The HDR metadata stays fixed for as long as the output stays in HDR. Any change
                 // of the infoframe is a full modeset on nvidia whenever the GPU has a non-HDMI
                 // connector (NVKMS only synchronizes infoframes with flips on all-HDMI devices),
@@ -2552,18 +2626,12 @@ impl Tty {
                         .map(|desc| build_hdr_metadata(desc, &edid_hdr))
                         .unwrap_or_else(|| display_hdr_metadata(&edid_hdr)),
                 };
-                ConnectorColorState {
-                    colorspace: Colorspace::Bt2020Rgb,
-                    hdr_metadata: Some(hdr_metadata),
-                    max_bpc,
-                }
+                Some(hdr_metadata)
             } else {
-                ConnectorColorState {
-                    colorspace: Colorspace::Default,
-                    hdr_metadata: None,
-                    max_bpc,
-                }
+                None
             };
+            let desired =
+                hdr_connector_color_state(hdr_metadata, requested_signal, max_bpc, ll_dv_bpc);
 
             if surface.compositor.pending_color_state() != desired
                 && surface.failed_color_state != Some(desired)
@@ -2573,18 +2641,48 @@ impl Tty {
                         surface.failed_color_state = None;
                         info!(
                             connector = surface.name.connector,
-                            hdr = desired.hdr_metadata.is_some(),
+                            hdr = is_hdr_color_state(desired),
+                            ll_dv = is_ll_dv_state(desired),
                             "updated HDR signalling to match content"
                         );
                     }
                     Err(err) => {
-                        surface.failed_color_state = Some(desired);
+                        let temporary =
+                            matches!(&err, FrameError::DrmError(err) if temporary_drm_error(err));
+                        surface.failed_color_state = (!temporary).then_some(desired);
                         warn!("failed to update HDR signalling: {err:?}");
+                        if is_ll_dv_state(desired) && !temporary {
+                            surface.ll_dv_rejected = true;
+                            let fallback = hdr_connector_color_state(
+                                hdr_metadata,
+                                HdrSignal::Hdr10,
+                                max_bpc,
+                                None,
+                            );
+                            warn!(connector = surface.name.connector, "LLDV rejected; falling back to HDR10 until output configuration changes or recreation");
+                            match surface.compositor.use_color_state(fallback) {
+                                Ok(()) => surface.failed_color_state = None,
+                                Err(err) => {
+                                    let temporary = matches!(&err,
+                                        FrameError::DrmError(err) if temporary_drm_error(err));
+                                    surface.failed_color_state = (!temporary).then_some(fallback);
+                                    warn!("failed to stage HDR10 fallback: {err:?}");
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            (blend_hdr, reference_luminance, edid_hdr)
+            // A failed state change must not leave PQ pixels paired with SDR signalling,
+            // or vice versa. Render for the state Smithay actually has staged.
+            let staged = surface.compositor.pending_color_state();
+            (
+                is_hdr_color_state(staged),
+                is_ll_dv_state(staged),
+                reference_luminance,
+                edid_hdr,
+            )
         };
 
         // Per-element scanout color transforms: reproduce the blend shaders' conversions in
@@ -2677,9 +2775,11 @@ impl Tty {
                 .gamma_props
                 .as_ref()
                 .is_some_and(|props| props.previous_blob.is_some());
-        let post_blend =
-            (blend_hdr && !gamma_in_use && self.config.borrow().debug.scanout_post_blend_encode)
-                .then(|| blend::hdr_post_blend_encode(peak_luminance));
+        let post_blend = (blend_hdr
+            && !blend_ll_dv
+            && !gamma_in_use
+            && self.config.borrow().debug.scanout_post_blend_encode)
+            .then(|| blend::hdr_post_blend_encode(peak_luminance));
         #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
         let linear_transforms = match post_blend {
             Some(encode) => transforms
@@ -2737,6 +2837,14 @@ impl Tty {
             if debug.disable_cursor_plane {
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
             }
+            if blend_ll_dv {
+                // Keep experimental LLDV on one known PQ/BT.2020 compositor buffer.
+                // Direct scanout and cursor/overlay planes can select other formats or
+                // color pipelines that have not been validated for this transport.
+                flags.remove(primary_scanout_flag);
+                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+                flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+            }
             if debug.skip_cursor_only_updates_during_vrr && cursor_update_deadline.is_some() {
                 flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
             }
@@ -2766,6 +2874,7 @@ impl Tty {
         };
 
         // Hand them over to the DRM.
+        let mut retry_hdr_fallback = false;
         set_frame_blend_tty(&mut renderer, blend);
         let drm_compositor = &mut surface.compositor;
         let render_frame_result = drm_compositor.render_frame::<_, _>(
@@ -2877,6 +2986,9 @@ impl Tty {
                             return RenderResult::Submitted;
                         }
                         Err(err) => {
+                            if let FrameError::DrmError(drm_err) = &err {
+                                retry_hdr_fallback = reject_ll_dv_after_drm_error(surface, drm_err);
+                            }
                             warn!("error queueing frame: {err:?}");
                         }
                     }
@@ -2890,6 +3002,9 @@ impl Tty {
                 }
             }
             Err(err) => {
+                if let RenderFrameError::PrepareFrame(FrameError::DrmError(drm_err)) = &err {
+                    retry_hdr_fallback = reject_ll_dv_after_drm_error(surface, drm_err);
+                }
                 // Can fail if we switched to a different TTY.
                 warn!("error rendering frame: {err}");
             }
@@ -2900,6 +3015,9 @@ impl Tty {
 
         // Queue a timer to fire at the predicted vblank time.
         queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+        if retry_hdr_fallback {
+            niri.queue_redraw(output);
+        }
 
         rv
     }
@@ -3399,11 +3517,16 @@ impl Tty {
                 // The scanout format list (8-bit vs 10-bit) is fixed when the compositor is
                 // created, so toggling HDR would otherwise leave an output that was set up as SDR
                 // rendering PQ into an 8-bit framebuffer. Recreate the output instead; entering or
-                // leaving HDR is a full modeset anyway.
+                // leaving HDR is a full modeset anyway. HDR10 and LLDV use the same
+                // framebuffer formats: changing only the signal must preserve wl_output
+                // and layer surfaces, rather than simulate unplugging the monitor.
                 let disable_10bit_output = self.config.borrow().debug.disable_10bit_output;
-                if wants_10bit_formats(&config, surface.hdr_supported, disable_10bit_output)
-                    != surface.wants_10bit_formats
-                {
+                if output_format_change_requires_recreation(
+                    surface.wants_10bit_formats,
+                    &config,
+                    surface.hdr_supported,
+                    disable_10bit_output,
+                ) {
                     debug!(
                         "output {:?}: hdr changed, recreating to switch scanout formats",
                         surface.name.connector
@@ -3442,6 +3565,7 @@ impl Tty {
                 // reconciliation; give a previously rejected state another chance with the
                 // new config.
                 surface.failed_color_state = None;
+                surface.ll_dv_rejected = false;
 
                 let change_mode = surface.compositor.pending_mode() != mode;
 
@@ -4433,6 +4557,7 @@ fn initial_connector_color_state(
     hdr_supported: bool,
     edid: EdidHdrInfo,
     max_bpc_range: &Option<RangeInclusive<u32>>,
+    ll_dv_bpc: Option<u32>,
 ) -> ConnectorColorState {
     let hdr_config = config.hdr.as_ref();
     let hdr_metadata = (hdr_supported && hdr_config.is_some_and(|hdr| hdr.mode == HdrMode::On))
@@ -4440,15 +4565,137 @@ fn initial_connector_color_state(
             let peak_luminance = hdr_config.and_then(|hdr| hdr.peak_luminance).map(|v| v.0);
             display_hdr_metadata(&edid.with_peak_luminance(peak_luminance))
         });
-    ConnectorColorState {
-        colorspace: if hdr_metadata.is_some() {
-            Colorspace::Bt2020Rgb
-        } else {
-            Colorspace::Default
-        },
+    hdr_connector_color_state(
         hdr_metadata,
-        max_bpc: effective_max_bpc(config, max_bpc_range),
+        hdr_config.map(|hdr| hdr.signal).unwrap_or_default(),
+        effective_max_bpc(config, max_bpc_range),
+        ll_dv_bpc,
+    )
+}
+
+/// The minimum advertised 4:4:4 bit depth for the experimental low-latency path.
+/// A missing max-bpc property leaves link negotiation to the driver; this does not
+/// certify the actual HDMI encoding, quantization range or bits per component.
+fn ll_dv_output_bpc(
+    connector_supported: bool,
+    capabilities: Option<smithay_drm_extras::display_info::DolbyVisionCapabilities>,
+    range: &Option<RangeInclusive<u32>>,
+) -> Option<u32> {
+    let caps = capabilities.filter(|caps| connector_supported && caps.supports_low_latency)?;
+    let bpc = if caps.supports_444_10bit {
+        10
+    } else if caps.supports_444_12bit {
+        12
+    } else {
+        return None;
+    };
+    if range.as_ref().is_some_and(|range| *range.end() < bpc) {
+        return None;
     }
+    Some(bpc)
+}
+
+/// Select exactly one HDR transport. Clearing HDR or switching back to HDR10
+/// explicitly clears VSIF, so a monitor cannot remain latched in Dolby Vision.
+fn hdr_connector_color_state(
+    hdr_metadata: Option<HdrOutputMetadata>,
+    signal: HdrSignal,
+    max_bpc: Option<u32>,
+    ll_dv_bpc: Option<u32>,
+) -> ConnectorColorState {
+    let Some(metadata) = hdr_metadata else {
+        return ConnectorColorState {
+            max_bpc,
+            ..Default::default()
+        };
+    };
+    if signal == HdrSignal::LowLatencyDolbyVision {
+        if let Some(required_bpc) = ll_dv_bpc {
+            return ConnectorColorState {
+                colorspace: Colorspace::Bt2020Rgb,
+                hdr_metadata: None,
+                hdmi_vsif: Some(HdmiVsifMetadata::low_latency_dolby_vision()),
+                max_bpc: max_bpc.map(|bpc| bpc.max(required_bpc)),
+            };
+        }
+    }
+    ConnectorColorState {
+        colorspace: Colorspace::Bt2020Rgb,
+        hdr_metadata: Some(metadata),
+        hdmi_vsif: None,
+        max_bpc,
+    }
+}
+
+fn is_ll_dv_state(state: ConnectorColorState) -> bool {
+    state.hdmi_vsif.is_some_and(|vsif| {
+        let bytes = vsif.as_bytes();
+        bytes.len() >= 4 && bytes[..3] == [0x46, 0xd0, 0] && bytes[3] & 3 == 3
+    })
+}
+
+fn is_hdr_color_state(state: ConnectorColorState) -> bool {
+    state.hdr_metadata.is_some() || is_ll_dv_state(state)
+}
+
+fn connector_hdr_signal(state: ConnectorColorState) -> Option<niri_ipc::OutputHdrSignal> {
+    if is_ll_dv_state(state) {
+        Some(niri_ipc::OutputHdrSignal::LowLatencyDolbyVision)
+    } else if state
+        .hdr_metadata
+        .is_some_and(|metadata| metadata.eotf == Eotf::SmpteSt2084)
+    {
+        Some(niri_ipc::OutputHdrSignal::Hdr10)
+    } else {
+        None
+    }
+}
+
+fn temporary_drm_access_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ResourceBusy
+    )
+}
+
+fn temporary_drm_error(err: &DrmError) -> bool {
+    match err {
+        DrmError::DeviceInactive | DrmError::DrmMasterFailed => true,
+        DrmError::Access(err) => temporary_drm_access_error(err.source.kind()),
+        _ => false,
+    }
+}
+
+fn should_reject_ll_dv_frame(pending: ConnectorColorState, rejected: bool, err: &DrmError) -> bool {
+    if rejected || !is_ll_dv_state(pending) {
+        return false;
+    }
+    !temporary_drm_error(err)
+}
+
+/// A frame can fail its real DRM test/commit after the preliminary color-state test passed.
+/// Stop trying LLDV and redraw through the HDR10 reconciliation path, preserving retries for
+/// temporary loss of the device or DRM master during session switches.
+fn reject_ll_dv_after_drm_error(surface: &mut Surface, err: &DrmError) -> bool {
+    if !should_reject_ll_dv_frame(
+        surface.compositor.pending_color_state(),
+        surface.ll_dv_rejected,
+        err,
+    ) {
+        return false;
+    }
+
+    surface.ll_dv_rejected = true;
+    surface.failed_color_state = None;
+    surface.last_blend = None;
+    warn!(
+        connector = surface.name.connector,
+        "LLDV frame rejected by DRM; retrying with HDR10 until output configuration changes: {err:?}"
+    );
+    true
 }
 
 /// Builds the HDR static metadata to signal on the connector for a client's image description:
@@ -4581,6 +4828,17 @@ fn wants_10bit_formats(
     disable_10bit_output: bool,
 ) -> bool {
     output.hdr.is_some() && hdr_supported && !hdr_force_8bit(disable_10bit_output)
+}
+
+/// The format list is fixed for a compositor's lifetime. Signal-only changes are
+/// staged in the render loop and must not destroy the output's Wayland identity.
+fn output_format_change_requires_recreation(
+    previously_wanted_10bit: bool,
+    output: &niri_config::Output,
+    hdr_supported: bool,
+    disable_10bit_output: bool,
+) -> bool {
+    wants_10bit_formats(output, hdr_supported, disable_10bit_output) != previously_wanted_10bit
 }
 
 /// The `max bpc` to request for an output. When HDR is enabled this is at least 10 (HDR needs at
@@ -4729,9 +4987,340 @@ mod tests {
 
     use crate::backend::tty::{
         build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt,
-        composition_render_node, display_hdr_metadata, effective_vrr, feedback_formats,
-        initial_connector_color_state, presentation_mode, EdidHdrInfo, FrameRenderStatus,
+        composition_render_node, connector_hdr_signal, display_hdr_metadata, effective_vrr,
+        feedback_formats, hdr_connector_color_state, initial_connector_color_state,
+        is_hdr_color_state, is_ll_dv_state, ll_dv_output_bpc,
+        output_format_change_requires_recreation, presentation_mode, should_reject_ll_dv_frame,
+        temporary_drm_access_error, wants_10bit_formats, EdidHdrInfo, FrameRenderStatus,
     };
+
+    #[test]
+    fn switching_hdr_signal_preserves_output_while_updating_connector_state() {
+        use niri_config::output::{Hdr, HdrMode, HdrSignal};
+
+        let mut config = niri_config::Output {
+            hdr: Some(Hdr {
+                mode: HdrMode::On,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let previous_formats = wants_10bit_formats(&config, true, false);
+        let edid = EdidHdrInfo::default();
+        for signal in [
+            HdrSignal::Hdr10,
+            HdrSignal::LowLatencyDolbyVision,
+            HdrSignal::Hdr10,
+        ] {
+            config.hdr.as_mut().unwrap().signal = signal;
+            assert!(!output_format_change_requires_recreation(
+                previous_formats,
+                &config,
+                true,
+                false
+            ));
+            let state = initial_connector_color_state(&config, true, edid, &None, Some(12));
+            assert!(is_hdr_color_state(state));
+            assert_eq!(
+                is_ll_dv_state(state),
+                signal == HdrSignal::LowLatencyDolbyVision
+            );
+            assert_eq!(state.hdr_metadata.is_some(), signal == HdrSignal::Hdr10);
+        }
+
+        // Changing the actual format requirement still recreates a 10-bit output.
+        config.hdr = None;
+        assert!(output_format_change_requires_recreation(
+            true, &config, true, false
+        ));
+        config.hdr = Some(Hdr::default());
+        assert!(output_format_change_requires_recreation(
+            true, &config, true, true
+        ));
+        assert_eq!(
+            output_format_change_requires_recreation(false, &config, true, false),
+            previous_formats
+        );
+    }
+
+    #[test]
+    fn ll_dv_commit_failure_falls_back_once_while_retaining_pq_hdr() {
+        use std::num::NonZeroU32;
+
+        use niri_config::output::HdrSignal;
+        use smithay::backend::drm::{ConnectorColorState, DrmError};
+        use smithay::reexports::drm::control::crtc;
+
+        let metadata = display_hdr_metadata(&EdidHdrInfo::default());
+        let pending = hdr_connector_color_state(
+            Some(metadata),
+            HdrSignal::LowLatencyDolbyVision,
+            Some(10),
+            Some(12),
+        );
+        let error = DrmError::TestFailed(crtc::Handle::from(NonZeroU32::new(1).unwrap()));
+        let rejected = should_reject_ll_dv_frame(pending, false, &error);
+        assert!(rejected);
+        assert!(!should_reject_ll_dv_frame(pending, rejected, &error));
+
+        // The next reconciliation keeps the HDR rendering space but switches the signal
+        // and max-bpc request back to HDR10. A repeated failure cannot cause an LLDV loop.
+        let fallback = hdr_connector_color_state(
+            Some(metadata),
+            HdrSignal::LowLatencyDolbyVision,
+            Some(10),
+            (!rejected).then_some(12),
+        );
+        assert!(is_hdr_color_state(pending));
+        assert!(is_hdr_color_state(fallback));
+        assert_eq!(fallback.hdmi_vsif, None);
+        assert_eq!(fallback.hdr_metadata, Some(metadata));
+        assert_eq!(fallback.max_bpc, Some(10));
+        assert!(!should_reject_ll_dv_frame(fallback, false, &error));
+        assert!(!should_reject_ll_dv_frame(
+            ConnectorColorState::default(),
+            false,
+            &error
+        ));
+
+        // An output config change clears the rejection flag, allowing changed modes or bit-depth
+        // limits one new attempt; only that attempt's own failure can reject it again.
+        assert!(should_reject_ll_dv_frame(pending, false, &error));
+    }
+
+    #[test]
+    fn ll_dv_commit_failure_excludes_session_switch_and_temporary_access_errors() {
+        use std::io;
+
+        use niri_config::output::HdrSignal;
+        use smithay::backend::drm::DrmError;
+
+        let pending = hdr_connector_color_state(
+            Some(display_hdr_metadata(&EdidHdrInfo::default())),
+            HdrSignal::LowLatencyDolbyVision,
+            None,
+            Some(12),
+        );
+        for error in [DrmError::DeviceInactive, DrmError::DrmMasterFailed] {
+            assert!(!should_reject_ll_dv_frame(pending, false, &error));
+        }
+        // These are the actual errno classes returned during VT/master changes or a busy
+        // atomic commit. Invalid formats and device I/O failures still permit fallback.
+        for errno in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EAGAIN,
+            libc::EINTR,
+            libc::EBUSY,
+        ] {
+            assert!(temporary_drm_access_error(
+                io::Error::from_raw_os_error(errno).kind()
+            ));
+        }
+        for errno in [libc::EINVAL, libc::EIO, libc::ENODEV, libc::ENOMEM] {
+            assert!(!temporary_drm_access_error(
+                io::Error::from_raw_os_error(errno).kind()
+            ));
+        }
+    }
+
+    #[test]
+    fn committed_hdr_signal_reports_hdr10_ll_dv_and_unknown_separately() {
+        use niri_config::output::HdrSignal;
+        use niri_ipc::OutputHdrSignal;
+        use smithay::backend::drm::{ConnectorColorState, Eotf, HdmiVsifMetadata};
+
+        let metadata = display_hdr_metadata(&EdidHdrInfo::default());
+        let current = hdr_connector_color_state(Some(metadata), HdrSignal::Hdr10, Some(10), None);
+        let pending = hdr_connector_color_state(
+            Some(metadata),
+            HdrSignal::LowLatencyDolbyVision,
+            Some(10),
+            Some(12),
+        );
+        // A staged transition cannot change the status derived from the committed state.
+        assert_eq!(connector_hdr_signal(current), Some(OutputHdrSignal::Hdr10));
+        assert_eq!(
+            connector_hdr_signal(pending),
+            Some(OutputHdrSignal::LowLatencyDolbyVision)
+        );
+        assert_eq!(connector_hdr_signal(ConnectorColorState::default()), None);
+        assert_eq!(
+            connector_hdr_signal(ConnectorColorState {
+                hdr_metadata: Some(smithay::backend::drm::HdrOutputMetadata {
+                    eotf: Eotf::Hlg,
+                    ..metadata
+                }),
+                ..Default::default()
+            }),
+            None
+        );
+        // A foreign vendor payload or the DV OUI without both LLDV flags is not LLDV.
+        for payload in [[0x01, 0x02, 0x03, 0x03], [0x46, 0xd0, 0x00, 0x01]] {
+            assert_eq!(
+                connector_hdr_signal(ConnectorColorState {
+                    hdmi_vsif: HdmiVsifMetadata::new(&payload),
+                    ..Default::default()
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn hdr_signal_transitions_clear_the_other_transport() {
+        use niri_config::output::HdrSignal;
+        use smithay::backend::drm::{Colorspace, HdmiVsifMetadata};
+
+        let metadata = display_hdr_metadata(&EdidHdrInfo::default());
+        let ll_dv = hdr_connector_color_state(
+            Some(metadata),
+            HdrSignal::LowLatencyDolbyVision,
+            Some(10),
+            Some(12),
+        );
+        assert!(is_hdr_color_state(ll_dv));
+        assert!(is_ll_dv_state(ll_dv));
+        assert_eq!(ll_dv.colorspace, Colorspace::Bt2020Rgb);
+        assert_eq!(ll_dv.hdr_metadata, None);
+        assert_eq!(
+            ll_dv.hdmi_vsif,
+            Some(HdmiVsifMetadata::low_latency_dolby_vision())
+        );
+        assert_eq!(ll_dv.max_bpc, Some(12));
+
+        // Explicit HDR10 and unsupported/rejected LLDV must produce the same state.
+        let hdr10 = hdr_connector_color_state(Some(metadata), HdrSignal::Hdr10, Some(10), Some(12));
+        let fallback = hdr_connector_color_state(
+            Some(metadata),
+            HdrSignal::LowLatencyDolbyVision,
+            Some(10),
+            None,
+        );
+        assert_eq!(hdr10, fallback);
+        assert_eq!(hdr10.hdr_metadata, Some(metadata));
+        assert_eq!(hdr10.hdmi_vsif, None);
+        assert!(is_hdr_color_state(hdr10));
+        assert!(!is_ll_dv_state(hdr10));
+
+        // In auto mode, leaving fullscreen HDR disables both transports.
+        for signal in [HdrSignal::Hdr10, HdrSignal::LowLatencyDolbyVision] {
+            let sdr = hdr_connector_color_state(None, signal, Some(10), Some(12));
+            assert_eq!(sdr.colorspace, Colorspace::Default);
+            assert_eq!(sdr.hdr_metadata, None);
+            assert_eq!(sdr.hdmi_vsif, None);
+            assert!(!is_hdr_color_state(sdr));
+        }
+        // NVIDIA may lack a max-bpc property: never invent a property request.
+        assert_eq!(
+            hdr_connector_color_state(
+                Some(metadata),
+                HdrSignal::LowLatencyDolbyVision,
+                None,
+                Some(12),
+            )
+            .max_bpc,
+            None
+        );
+    }
+
+    #[test]
+    fn ll_dv_requires_connector_and_compatible_sink_capabilities() {
+        use smithay_drm_extras::display_info::DolbyVisionCapabilities;
+
+        let caps = DolbyVisionCapabilities {
+            version: 2,
+            supports_low_latency: true,
+            supports_standard: false,
+            supports_low_latency_hdmi: true,
+            supports_444_10bit: false,
+            supports_444_12bit: true,
+            ycbcr422_12bit: false,
+            target_min_luminance: 0.0006,
+            target_max_luminance: 578.3,
+            primaries: [[0.6758, 0.3164], [0.2656, 0.6914], [0.1484, 0.0586]],
+        };
+        assert_eq!(ll_dv_output_bpc(true, Some(caps), &None), Some(12));
+        assert_eq!(ll_dv_output_bpc(true, Some(caps), &Some(8..=12)), Some(12));
+        assert_eq!(ll_dv_output_bpc(true, Some(caps), &Some(8..=10)), None);
+        assert_eq!(ll_dv_output_bpc(false, Some(caps), &None), None);
+        assert_eq!(ll_dv_output_bpc(true, None, &None), None);
+        assert_eq!(
+            ll_dv_output_bpc(
+                true,
+                Some(DolbyVisionCapabilities {
+                    supports_low_latency: false,
+                    ..caps
+                }),
+                &None
+            ),
+            None
+        );
+        // A sink supporting only 4:2:2 cannot use this 4:4:4 compositor path.
+        assert_eq!(
+            ll_dv_output_bpc(
+                true,
+                Some(DolbyVisionCapabilities {
+                    supports_444_12bit: false,
+                    ycbcr422_12bit: true,
+                    ..caps
+                }),
+                &None
+            ),
+            None
+        );
+        assert_eq!(
+            ll_dv_output_bpc(
+                true,
+                Some(DolbyVisionCapabilities {
+                    supports_444_10bit: true,
+                    supports_444_12bit: false,
+                    ..caps
+                }),
+                &Some(8..=10)
+            ),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn ll_dv_initial_state_obeys_hdr_mode_and_capability_gate() {
+        use niri_config::output::{Hdr, HdrMode, HdrSignal};
+
+        let mut config = niri_config::Output {
+            hdr: Some(Hdr {
+                signal: HdrSignal::LowLatencyDolbyVision,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let edid = EdidHdrInfo::default();
+        assert!(!is_hdr_color_state(initial_connector_color_state(
+            &config,
+            true,
+            edid,
+            &None,
+            Some(12)
+        )));
+        config.hdr.as_mut().unwrap().mode = HdrMode::On;
+        assert!(is_ll_dv_state(initial_connector_color_state(
+            &config,
+            true,
+            edid,
+            &None,
+            Some(12)
+        )));
+        assert!(!is_hdr_color_state(initial_connector_color_state(
+            &config,
+            false,
+            edid,
+            &None,
+            Some(12)
+        )));
+        let fallback = initial_connector_color_state(&config, true, edid, &None, None);
+        assert!(fallback.hdr_metadata.is_some());
+        assert!(fallback.hdmi_vsif.is_none());
+    }
 
     #[test]
     fn initial_hdr_state_matches_runtime_metadata_and_peak_override() {
@@ -4754,7 +5343,7 @@ mod tests {
             min_luminance: 100,
             max_frame_avg_luminance: 600,
         };
-        let initial = initial_connector_color_state(&config, true, edid, &Some(8..=16));
+        let initial = initial_connector_color_state(&config, true, edid, &Some(8..=16), None);
         let metadata = initial.hdr_metadata.unwrap();
         assert_eq!(metadata.max_display_mastering_luminance, 400);
         assert_eq!(metadata.max_cll, 400);
@@ -4764,6 +5353,7 @@ mod tests {
             ConnectorColorState {
                 colorspace: Colorspace::Bt2020Rgb,
                 hdr_metadata: Some(display_hdr_metadata(&edid.with_peak_luminance(Some(400.4)))),
+                hdmi_vsif: None,
                 max_bpc: Some(10),
             }
         );
@@ -4795,16 +5385,18 @@ mod tests {
                     &config,
                     supported,
                     EdidHdrInfo::default(),
-                    &Some(8..=16)
+                    &Some(8..=16),
+                    None,
                 ),
                 ConnectorColorState {
                     colorspace: Colorspace::Default,
                     hdr_metadata: None,
+                    hdmi_vsif: None,
                     max_bpc
                 }
             );
             assert_eq!(
-                initial_connector_color_state(&config, false, EdidHdrInfo::default(), &None),
+                initial_connector_color_state(&config, false, EdidHdrInfo::default(), &None, None),
                 ConnectorColorState::default()
             );
         }

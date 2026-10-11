@@ -142,26 +142,35 @@ fn feedback_preferred_defaults_to_srgb() {
 
 #[test]
 fn feedback_preferred_is_pq_with_mode_on() {
-    let mut f = fixture_with_hdr_mode_on();
+    use niri_config::output::HdrSignal;
 
-    let id = f.add_client();
-    let window = f.client(id).create_window();
-    let surface = window.surface.clone();
-    window.commit();
-    f.roundtrip(id);
-    let window = f.client(id).window(&surface);
-    window.attach_new_buffer();
-    window.ack_last_and_commit();
-    f.double_roundtrip(id);
+    for signal in [HdrSignal::Hdr10, HdrSignal::LowLatencyDolbyVision] {
+        let mut f = fixture_with_hdr_mode_on();
+        f.niri().config.borrow_mut().outputs.0[0]
+            .hdr
+            .as_mut()
+            .unwrap()
+            .signal = signal;
 
-    // An SDL3-style client probes the preferred description once at startup, before going
-    // fullscreen. With mode "on" it must see PQ/BT.2020 right away.
-    f.client(id).probe_surface_preferred(&surface);
-    f.double_roundtrip(id);
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+        let window = f.client(id).window(&surface);
+        window.attach_new_buffer();
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
 
-    let client = f.client(id);
-    assert_eq!(client.state.info_tf, Some(TransferFunction::St2084Pq));
-    assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
+        // An SDL3-style client probes once at startup. Both transports retain the
+        // PQ/BT.2020 client contract, including when LLDV falls back to HDR10.
+        f.client(id).probe_surface_preferred(&surface);
+        f.double_roundtrip(id);
+
+        let client = f.client(id);
+        assert_eq!(client.state.info_tf, Some(TransferFunction::St2084Pq));
+        assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
+    }
 }
 
 #[test]

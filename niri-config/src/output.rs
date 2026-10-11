@@ -222,14 +222,18 @@ impl<S: ErrorSpan> knuffel::DecodeScalar<S> for TearingMode {
 /// HDR (high dynamic range) output configuration.
 ///
 /// Presence of the `hdr` node enables HDR signalling on the output: niri will request a 10-bit (or
-/// wider) scanout buffer, set the connector `Colorspace` to BT.2020 RGB, and attach an
-/// `HDR_OUTPUT_METADATA` infoframe advertising the PQ (SMPTE ST 2084) transfer function. This is
-/// only acted upon for outputs whose driver exposes the corresponding DRM connector properties.
+/// wider) scanout buffer and set the connector `Colorspace` to BT.2020 RGB. The default HDR10
+/// signal attaches an `HDR_OUTPUT_METADATA` infoframe advertising PQ (SMPTE ST 2084). The
+/// experimental low-latency Dolby Vision signal uses vendor metadata with the existing PQ
+/// rendering path. Both require the corresponding DRM connector properties.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
 pub struct Hdr {
     /// When HDR engages on this output.
     #[knuffel(property, str, default)]
     pub mode: HdrMode,
+    /// HDR signalling format, configured as a child node. Defaults to HDR10.
+    #[knuffel(child, unwrap(argument, str), default)]
+    pub signal: HdrSignal,
     /// Luminance, in cd/m² (nits), that SDR white (the value 1.0) is mapped to while the output is
     /// in HDR mode. Defaults to 203 cd/m² (the BT.2408 reference white) when unset.
     #[knuffel(child, unwrap(argument))]
@@ -266,6 +270,31 @@ impl std::str::FromStr for HdrMode {
             "on" => Ok(Self::On),
             _ => Err(miette::miette!(
                 r#"invalid HDR mode, can be "auto" or "on""#
+            )),
+        }
+    }
+}
+
+/// Signalling format for an `hdr`-enabled output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HdrSignal {
+    /// BT.2020 / PQ with HDR10 static metadata.
+    #[default]
+    Hdr10,
+    /// Experimental low-latency Dolby Vision signalling with the existing PQ / BT.2020 renderer.
+    /// This does not implement Dolby Vision RPU processing or enhancement-layer decoding.
+    LowLatencyDolbyVision,
+}
+
+impl std::str::FromStr for HdrSignal {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "hdr10" => Ok(Self::Hdr10),
+            "ll-dv" => Ok(Self::LowLatencyDolbyVision),
+            _ => Err(miette::miette!(
+                r#"invalid HDR signal, can be "hdr10" or "ll-dv""#
             )),
         }
     }
@@ -671,6 +700,89 @@ mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
+
+    #[test]
+    fn parse_hdr_signal_defaults_to_hdr10() {
+        let absent = crate::Config::parse_mem(r#"output "HDMI-A-1" {}"#).unwrap();
+        assert!(absent.outputs.0[0].hdr.is_none());
+
+        for text in [
+            r#"output "HDMI-A-1" { hdr; }"#,
+            r#"output "HDMI-A-1" { hdr {}; }"#,
+            r#"output "HDMI-A-1" { hdr { signal "hdr10"; }; }"#,
+        ] {
+            let config = crate::Config::parse_mem(text).unwrap();
+            let hdr = config.outputs.0[0].hdr.as_ref().unwrap();
+            assert_eq!(hdr.signal, HdrSignal::Hdr10);
+            assert_eq!(hdr.mode, HdrMode::Auto);
+        }
+        assert_eq!(Hdr::default().signal, HdrSignal::Hdr10);
+    }
+
+    #[test]
+    fn parse_hdr_signal_low_latency_dolby_vision() {
+        let config = crate::Config::parse_mem(
+            r#"
+            output "HDMI-A-1" {
+                hdr mode="on" {
+                    reference-luminance 203
+                    signal "ll-dv"
+                    peak-luminance 600
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let hdr = config.outputs.0[0].hdr.as_ref().unwrap();
+        assert_eq!(hdr.signal, HdrSignal::LowLatencyDolbyVision);
+        assert_eq!(hdr.mode, HdrMode::On);
+        assert_eq!(hdr.reference_luminance, Some(FloatOrInt(203.0)));
+        assert_eq!(hdr.peak_luminance, Some(FloatOrInt(600.0)));
+    }
+
+    #[test]
+    fn parse_hdr_signal_rejects_invalid_values() {
+        for value in [
+            r#""dolby-vision""#,
+            r#""hdr10+""#,
+            r#""""#,
+            "10",
+            "true",
+            "null",
+        ] {
+            let text = format!(r#"output "HDMI-A-1" {{ hdr {{ signal {value}; }}; }}"#);
+            assert!(crate::Config::parse_mem(&text).is_err(), "accepted {text}");
+        }
+    }
+
+    #[test]
+    fn parse_hdr_signal_rejects_properties() {
+        for signal in ["hdr10", "ll-dv"] {
+            for hdr in [
+                format!(r#"hdr mode="on" signal="{signal}""#),
+                format!(r#"hdr signal="{signal}" {{ signal "{signal}"; }}"#),
+            ] {
+                let text = format!("output \"HDMI-A-1\" {{ {hdr}; }}");
+                assert!(crate::Config::parse_mem(&text).is_err(), "accepted {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_hdr_signal_rejects_duplicate_or_malformed_nodes() {
+        for hdr in [
+            r#"hdr { signal "ll-dv"; signal "hdr10"; }"#,
+            r#"hdr { signal "ll-dv"; signal "ll-dv"; }"#,
+            r#"hdr { signal; }"#,
+            r#"hdr { signal "ll-dv" "hdr10"; }"#,
+            r#"hdr { signal "ll-dv" extra=true; }"#,
+            r#"hdr { signal "ll-dv" { extra; }; }"#,
+            r#"hdr { signal="ll-dv"; }"#,
+        ] {
+            let text = format!("output \"HDMI-A-1\" {{ {hdr}; }}");
+            assert!(crate::Config::parse_mem(&text).is_err(), "accepted {text}");
+        }
+    }
 
     #[test]
     fn parse_mode() {

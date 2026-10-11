@@ -247,6 +247,7 @@ impl Backend {
                     cross_gpu_composition: None,
                     vrr_enabled: None,
                     hdr_enabled: None,
+                    hdr_signal: None,
                     last_frame: None,
                 },
             })

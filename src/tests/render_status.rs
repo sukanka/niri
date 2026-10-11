@@ -16,6 +16,7 @@ fn headless_render_status_reports_unknown_drm_state() {
         assert!(output.cross_gpu_composition.is_none());
         assert!(output.vrr_enabled.is_none());
         assert!(output.hdr_enabled.is_none());
+        assert!(output.hdr_signal.is_none());
         assert!(output.last_frame.is_none());
     }
 }
