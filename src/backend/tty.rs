@@ -90,6 +90,9 @@ use crate::render_helpers::renderer::{AsGlesRenderer, AsVulkanRenderer};
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
+mod hdr_vsif_recovery;
+use hdr_vsif_recovery::HdrVsifRecovery;
+
 /// Scanout formats offered on SDR outputs: 8-bit only. Requesting a 10-bit framebuffer is not
 /// free — some drivers (notably nvidia) hang the initial modeset when asked to scan out a 2101010
 /// buffer — so outputs that did not opt into HDR stay 8-bit.
@@ -413,6 +416,11 @@ struct Surface {
     ll_dv_bpc: Option<u32>,
     /// Stop retrying a rejected LLDV state until output configuration changes or recreation.
     ll_dv_rejected: bool,
+    /// NVIDIA's HDMI VSIF property permits a bounded neutral/clear recovery.
+    vsif_recovery_supported: bool,
+    hdr_vsif_recovery: HdrVsifRecovery,
+    /// A previously prepared frame must keep the colour state it was rendered for.
+    color_update_deferred: bool,
     /// HDR capabilities parsed from the sink's EDID.
     edid_hdr: EdidHdrInfo,
     /// Valid range of the connector's `max bpc` property, if it has one.
@@ -1287,6 +1295,8 @@ impl Tty {
                 if let Err(err) = surface.compositor.reset_state() {
                     warn!("error resetting DrmCompositor state: {err:?}");
                 }
+                // reset_state() retains queued frames. Preserve the recovery phase so
+                // those frames keep their colour state when the session resumes.
                 surface.compositor.reset_buffers();
             }
         }
@@ -2059,6 +2069,10 @@ impl Tty {
             hdr_supported,
             ll_dv_bpc,
             ll_dv_rejected,
+            vsif_recovery_supported: supports_vsif
+                && connector.interface() == connector::Interface::HDMIA,
+            hdr_vsif_recovery: HdrVsifRecovery::default(),
+            color_update_deferred: false,
             edid_hdr,
             max_bpc_range,
             wants_10bit_formats,
@@ -2329,6 +2343,7 @@ impl Tty {
                 if let FrameError::DrmError(drm_err) = &err {
                     redraw_needed |= reject_ll_dv_after_drm_error(surface, drm_err);
                 }
+                redraw_needed |= recover_after_frame_error(surface, &err);
                 let err: SwapBuffersError = err.into();
                 warn!("error marking frame as submitted: {err:?}");
             }
@@ -2337,6 +2352,8 @@ impl Tty {
         // frame_submitted() may have submitted a previously queued frame. Only its
         // successful DRM commit may publish the associated output color description.
         publish_committed_color_state(&output, &surface.compositor);
+        redraw_needed |= advance_vsif_recovery(surface);
+        redraw_needed |= surface.color_update_deferred;
 
         // A gamma change deferred by the post-blend encode offload can go through once the
         // compositor has committed a frame resetting the gamma LUT.
@@ -2404,7 +2421,24 @@ impl Tty {
             }
         }
 
-        if output_state.unfinished_animations_remain {
+        // A failed render returns Skipped, which clears a queued redraw in Niri::render.
+        // Keep transition retries here so cleanup also progresses on a static desktop.
+        let color_redraw = output
+            .user_data()
+            .get::<TtyOutputState>()
+            .and_then(|state| {
+                let device = self.devices.get(&state.node)?;
+                device
+                    .drm
+                    .is_active()
+                    .then_some(device)?
+                    .surfaces
+                    .get(&state.crtc)
+            })
+            .is_some_and(|surface| {
+                surface.hdr_vsif_recovery.in_progress() || surface.color_update_deferred
+            });
+        if output_state.unfinished_animations_remain || color_redraw {
             niri.queue_redraw(&output);
         } else {
             niri.send_frame_callbacks(&output);
@@ -2650,48 +2684,11 @@ impl Tty {
             let desired =
                 hdr_connector_color_state(hdr_metadata, requested_signal, max_bpc, ll_dv_bpc);
 
-            if surface.compositor.pending_color_state() != desired
-                && surface.failed_color_state != Some(desired)
-            {
-                match surface.compositor.use_color_state(desired) {
-                    Ok(()) => {
-                        surface.failed_color_state = None;
-                        info!(
-                            connector = surface.name.connector,
-                            hdr = is_hdr_color_state(desired),
-                            ll_dv = is_ll_dv_state(desired),
-                            "updated HDR signalling to match content"
-                        );
-                    }
-                    Err(err) => {
-                        let temporary = temporary_color_state_error(&err);
-                        surface.failed_color_state = (!temporary).then_some(desired);
-                        warn!(
-                            connector = surface.name.connector,
-                            format = ?surface.compositor.format(),
-                            ?desired,
-                            "failed to update HDR signalling: {err:?}"
-                        );
-                        if is_ll_dv_state(desired) && !temporary {
-                            surface.ll_dv_rejected = true;
-                            let fallback = hdr_connector_color_state(
-                                hdr_metadata,
-                                HdrSignal::Hdr10,
-                                max_bpc,
-                                None,
-                            );
-                            warn!(connector = surface.name.connector, "LLDV rejected; falling back to HDR10 until output configuration changes or recreation");
-                            match surface.compositor.use_color_state(fallback) {
-                                Ok(()) => surface.failed_color_state = None,
-                                Err(err) => {
-                                    let temporary = temporary_color_state_error(&err);
-                                    surface.failed_color_state = (!temporary).then_some(fallback);
-                                    warn!("failed to stage HDR10 fallback: {err:?}");
-                                }
-                            }
-                        }
-                    }
-                }
+            let fallback = hdr_connector_color_state(hdr_metadata, HdrSignal::Hdr10, max_bpc, None);
+            if !reconcile_connector_color_state(surface, desired, fallback) {
+                // Cleanup itself failed permanently. Keep the last accepted frame until
+                // configuration or device state changes, rather than resubmitting bad state.
+                return rv;
             }
 
             // A failed state change must not leave PQ pixels paired with SDR signalling,
@@ -2797,6 +2794,7 @@ impl Tty {
                 .is_some_and(|props| props.previous_blob.is_some());
         let post_blend = (blend_hdr
             && !blend_ll_dv
+            && !surface.hdr_vsif_recovery.in_progress()
             && !gamma_in_use
             && self.config.borrow().debug.scanout_post_blend_encode)
             .then(|| blend::hdr_post_blend_encode(peak_luminance));
@@ -2857,8 +2855,9 @@ impl Tty {
             if debug.disable_cursor_plane {
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
             }
-            if blend_ll_dv {
-                // Keep experimental LLDV on one known PQ/BT.2020 compositor buffer.
+            if blend_ll_dv || surface.hdr_vsif_recovery.in_progress() {
+                // Keep experimental LLDV and VSIF recovery on a compositor buffer
+                // encoded for the staged signal.
                 // Direct scanout and cursor/overlay planes can select other formats or
                 // color pipelines that have not been validated for this transport.
                 flags.remove(primary_scanout_flag);
@@ -2990,7 +2989,8 @@ impl Tty {
                                 niri.event_loop.remove(token);
                             }
                             let new_state = RedrawState::WaitingForVBlank {
-                                redraw_needed: false,
+                                redraw_needed: surface.hdr_vsif_recovery.in_progress()
+                                    || surface.color_update_deferred,
                             };
                             match mem::replace(&mut output_state.redraw_state, new_state) {
                                 RedrawState::Idle => unreachable!(),
@@ -3008,12 +3008,15 @@ impl Tty {
                             output_state.frame_callback_sequence =
                                 output_state.frame_callback_sequence.wrapping_add(1);
 
+                            advance_vsif_recovery(surface);
+
                             return RenderResult::Submitted;
                         }
                         Err(err) => {
                             if let FrameError::DrmError(drm_err) = &err {
                                 retry_hdr_fallback = reject_ll_dv_after_drm_error(surface, drm_err);
                             }
+                            retry_hdr_fallback |= recover_after_frame_error(surface, &err);
                             warn!("error queueing frame: {err:?}");
                         }
                     }
@@ -3030,6 +3033,9 @@ impl Tty {
                 if let RenderFrameError::PrepareFrame(FrameError::DrmError(drm_err)) = &err {
                     retry_hdr_fallback = reject_ll_dv_after_drm_error(surface, drm_err);
                 }
+                if let RenderFrameError::PrepareFrame(err) = &err {
+                    retry_hdr_fallback |= recover_after_frame_error(surface, err);
+                }
                 // Can fail if we switched to a different TTY.
                 warn!("error rendering frame: {err}");
             }
@@ -3040,7 +3046,10 @@ impl Tty {
 
         // Queue a timer to fire at the predicted vblank time.
         queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
-        if retry_hdr_fallback {
+        if retry_hdr_fallback
+            || surface.hdr_vsif_recovery.in_progress()
+            || surface.color_update_deferred
+        {
             niri.queue_redraw(output);
         }
 
@@ -3344,6 +3353,10 @@ impl Tty {
             for surface in device.surfaces.values_mut() {
                 if let Err(err) = surface.compositor.clear() {
                     warn!("error clearing drm surface: {err:?}");
+                } else {
+                    surface.hdr_vsif_recovery.device_reset();
+                    surface.failed_color_state = None;
+                    surface.color_update_deferred = false;
                 }
             }
         }
@@ -3591,6 +3604,7 @@ impl Tty {
                 // new config.
                 surface.failed_color_state = None;
                 surface.ll_dv_rejected = false;
+                surface.hdr_vsif_recovery.config_changed();
 
                 let change_mode = surface.compositor.pending_mode() != mode;
 
@@ -4717,6 +4731,165 @@ where
     }
 }
 
+fn invalid_color_state_error<A, B, F>(err: &FrameError<A, B, F>) -> bool
+where
+    A: std::error::Error + Send + Sync + 'static,
+    B: std::error::Error + Send + Sync + 'static,
+    F: std::error::Error + Send + Sync + 'static,
+{
+    matches!(err, FrameError::DrmError(DrmError::Access(access))
+        if access.source.kind() == io::ErrorKind::InvalidInput)
+}
+
+fn advance_vsif_recovery(surface: &mut Surface) -> bool {
+    let current = surface.compositor.current_color_state();
+    let pending = surface.compositor.pending_color_state();
+    let was_active = surface.hdr_vsif_recovery.in_progress();
+    let active = surface.hdr_vsif_recovery.applied(current, pending);
+    if was_active && !active {
+        debug!(
+            connector = surface.name.connector,
+            hdr = is_hdr_color_state(current),
+            "finished HDMI VSIF recovery sequence"
+        );
+    }
+    active
+}
+
+/// Stage one color transition per frame. A neutral HDMI VSIF must be committed
+/// before the following request clears it: repeating VSIF=None alone cannot
+/// refresh NVIDIA's stale per-CRTC cache after a detached connector cleared it.
+fn reconcile_connector_color_state(
+    surface: &mut Surface,
+    mut desired: ConnectorColorState,
+    hdr10_fallback: ConnectorColorState,
+) -> bool {
+    surface.color_update_deferred = false;
+    // A single call may choose LLDV fallback, start a neutral transition, or
+    // cancel a failed transition. Real commits always remain in the frame path.
+    for _ in 0..4 {
+        advance_vsif_recovery(surface);
+        let Some(target) = surface.hdr_vsif_recovery.target(desired) else {
+            return false;
+        };
+        let recovering = surface.hdr_vsif_recovery.in_progress();
+        if surface.compositor.pending_color_state() == target {
+            surface.hdr_vsif_recovery.staged(target);
+            advance_vsif_recovery(surface);
+            return true;
+        }
+        if !recovering && surface.failed_color_state == Some(target) {
+            return true;
+        }
+        if surface.compositor.queued_frame().is_some() {
+            // Smithay submits this already-rendered frame later from frame_submitted().
+            // Its pixels must keep their original pending connector colour state.
+            surface.color_update_deferred = true;
+            return true;
+        }
+
+        match surface.compositor.use_color_state(target) {
+            Ok(()) => {
+                if !surface.hdr_vsif_recovery.clearing() {
+                    surface.failed_color_state = None;
+                }
+                surface.hdr_vsif_recovery.staged(target);
+                info!(
+                    connector = surface.name.connector,
+                    hdr = is_hdr_color_state(target),
+                    ll_dv = is_ll_dv_state(target),
+                    "staged HDR signalling to match content"
+                );
+                return true;
+            }
+            Err(err) => {
+                warn!(
+                    connector = surface.name.connector,
+                    format = ?surface.compositor.format(),
+                    ?target,
+                    "failed to update HDR signalling: {err:?}"
+                );
+                if temporary_color_state_error(&err) {
+                    // Keep the transition and retry after a buffer/device becomes usable.
+                    surface.color_update_deferred = true;
+                    return true;
+                }
+                if is_ll_dv_state(target) && !surface.hdr_vsif_recovery.clearing() {
+                    surface.ll_dv_rejected = true;
+                    surface.failed_color_state = Some(target);
+                    desired = hdr10_fallback;
+                    warn!(connector = surface.name.connector, "LLDV rejected; falling back to HDR10 until output configuration changes or recreation");
+                    continue;
+                }
+                if recovering {
+                    let current = surface.compositor.current_color_state();
+                    if let Some(failed) = surface.hdr_vsif_recovery.failed(target, current) {
+                        surface.failed_color_state = Some(failed);
+                    }
+                    surface.compositor.reset_buffers();
+                    surface.last_blend = None;
+                    if surface.hdr_vsif_recovery.in_progress() {
+                        warn!(
+                            connector = surface.name.connector,
+                            "HDMI VSIF recovery failed; clearing the temporary signal with SDR"
+                        );
+                    } else {
+                        warn!(connector = surface.name.connector,
+                            "HDMI VSIF cleanup rejected; holding the last accepted frame until output configuration changes");
+                    }
+                    continue;
+                }
+                surface.failed_color_state = Some(target);
+                if invalid_color_state_error(&err)
+                    && surface.hdr_vsif_recovery.begin(
+                        surface.vsif_recovery_supported,
+                        surface.compositor.current_color_state(),
+                        target,
+                    )
+                {
+                    surface.failed_color_state = None;
+                    surface.compositor.reset_buffers();
+                    surface.last_blend = None;
+                    warn!(connector = surface.name.connector,
+                        "HDR10 rejected with VSIF cleared; trying one SDR neutral-VSIF frame to refresh the NVIDIA cache");
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// TEST_ONLY success is not a guarantee that the ensuing full frame can be
+/// committed. Cancel failed recovery frames before attempting another render.
+fn recover_after_frame_error<A, B, F>(surface: &mut Surface, err: &FrameError<A, B, F>) -> bool
+where
+    A: std::error::Error + Send + Sync + 'static,
+    B: std::error::Error + Send + Sync + 'static,
+    F: std::error::Error + Send + Sync + 'static,
+{
+    if !surface.hdr_vsif_recovery.in_progress() || temporary_color_state_error(err) {
+        return false;
+    }
+    let pending = surface.compositor.pending_color_state();
+    let current = surface.compositor.current_color_state();
+    if let Some(failed) = surface.hdr_vsif_recovery.failed(pending, current) {
+        surface.failed_color_state = Some(failed);
+    }
+    surface.compositor.reset_buffers();
+    surface.last_blend = None;
+    warn!(
+        connector = surface.name.connector,
+        "HDMI VSIF recovery frame failed; cancelling the transition: {err:?}"
+    );
+    if !surface.hdr_vsif_recovery.in_progress() {
+        warn!(connector = surface.name.connector,
+            "HDMI VSIF cleanup rejected; holding the last accepted frame until output configuration changes");
+    }
+    true
+}
+
 fn should_reject_ll_dv_frame(pending: ConnectorColorState, rejected: bool, err: &DrmError) -> bool {
     if rejected || !is_ll_dv_state(pending) {
         return false;
@@ -4739,6 +4912,7 @@ fn reject_ll_dv_after_drm_error(surface: &mut Surface, err: &DrmError) -> bool {
     surface.ll_dv_rejected = true;
     surface.failed_color_state = None;
     surface.last_blend = None;
+    surface.color_update_deferred = true;
     warn!(
         connector = surface.name.connector,
         "LLDV frame rejected by DRM; retrying with HDR10 until output configuration changes: {err:?}"
