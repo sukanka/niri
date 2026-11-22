@@ -169,6 +169,7 @@ use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
 use crate::niri_render_elements;
+use crate::protocols::color_representation;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -3120,6 +3121,7 @@ impl Niri {
             [RenderIntent::Perceptual],
             |_client| true,
         );
+        color_representation::create_global(&display_handle);
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         event_loop
             .insert_source(

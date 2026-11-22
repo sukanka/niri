@@ -7,6 +7,7 @@ mod server;
 
 mod animations;
 mod color_management;
+mod color_representation;
 mod floating;
 mod fullscreen;
 mod layer_shell;

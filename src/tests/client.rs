@@ -19,6 +19,7 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_info_v1::{self, WpImageDescriptionInfoV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_v1::{self, WpImageDescriptionV1};
+use smithay::reexports::wayland_protocols::wp::color_representation::v1::client::wp_color_representation_manager_v1::{self, WpColorRepresentationManagerV1};
 use smithay::reexports::wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
     zwp_locked_pointer_v1::ZwpLockedPointerV1,
@@ -97,6 +98,8 @@ pub struct State {
     pub commit_timing_manager: Option<WpCommitTimingManagerV1>,
     pub decoration_manager: Option<ZxdgDecorationManagerV1>,
     pub color_manager: Option<WpColorManagerV1>,
+    pub color_representation_manager: Option<WpColorRepresentationManagerV1>,
+    pub color_representation_events: Vec<wp_color_representation_manager_v1::Event>,
     /// Feedback objects kept alive so preferred_changed events can arrive.
     pub surface_feedbacks: Vec<WpColorManagementSurfaceFeedbackV1>,
     /// Identities received in preferred_changed events, in order.
@@ -254,6 +257,8 @@ impl Client {
             commit_timing_manager: None,
             decoration_manager: None,
             color_manager: None,
+            color_representation_manager: None,
+            color_representation_events: Vec::new(),
             surface_feedbacks: Vec::new(),
             preferred_changed: Vec::new(),
             ready_identities: Vec::new(),
@@ -922,6 +927,8 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZxdgDecorationManagerV1::interface().name {
                     let version = min(version, ZxdgDecorationManagerV1::interface().version);
                     state.decoration_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WpColorRepresentationManagerV1::interface().name {
+                    state.color_representation_manager = Some(registry.bind(name, 1, qh, ()));
                 } else if interface == WpColorManagerV1::interface().name {
                     let version = min(version, WpColorManagerV1::interface().version);
                     state.color_manager = Some(registry.bind(name, version, qh, ()));
@@ -1312,6 +1319,19 @@ impl Dispatch<WpViewport, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<WpColorRepresentationManagerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpColorRepresentationManagerV1,
+        event: wp_color_representation_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        state.color_representation_events.push(event);
     }
 }
 
